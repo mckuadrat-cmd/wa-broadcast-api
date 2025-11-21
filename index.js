@@ -69,7 +69,7 @@ async function sendWaTemplate({ phone, templateName, vars }) {
     type: "template",
     template: {
       name: templateName,
-      language: { code: "id" }, // sesuaikan dengan template WA-mu
+      language: { code: "en" }, // sesuaikan dengan template WA-mu
       components: [
         {
           type: "body",
