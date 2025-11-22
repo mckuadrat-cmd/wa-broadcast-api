@@ -1,6 +1,10 @@
 import express from "express";
 import fileUpload from "express-fileupload";
 
+const WABA_ID    = process.env.WABA_ID;
+const WA_TOKEN   = process.env.WA_TOKEN;   // nama ENV ngikut punya lu
+const WA_VERSION = process.env.WA_VERSION || "v20.0";
+
 const app = express();
 app.use(express.json());
 app.use(fileUpload());
@@ -68,6 +72,65 @@ app.post("/broadcast", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error", detail: String(err) });
+  }
+});
+
+app.post("/templates/create", async (req, res) => {
+  try {
+    const {
+      name,        // contoh: "kirim_hasil_test"
+      category,    // "UTILITY" atau "MARKETING"
+      language,    // "id"
+      body_text,   // teks template, boleh ada {{1}}
+      example_1    // contoh isi {{1}} biar Meta gampang approve (opsional)
+    } = req.body;
+
+    if (!name || !category || !language || !body_text) {
+      return res.status(400).json({ error: "name, category, language, body_text wajib diisi" });
+    }
+
+    if (!WABA_ID || !WA_TOKEN) {
+      return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
+    }
+
+    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
+
+    // payload minimal: 1 body component
+    const payload = {
+      name,          // harus huruf kecil + underscore sesuai aturan Meta
+      category,      // "UTILITY" / "MARKETING"
+      language,      // "id"
+      components: [
+        {
+          type: "BODY",
+          text: body_text,
+          // example boleh dikosongkan, tapi bagusnya diisi:
+          ...(example_1
+            ? { example: { body_text: [[example_1]] } }
+            : {})
+        }
+      ]
+    };
+
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    // Meta biasanya balas dengan id template atau detail status
+    return res.json({
+      status: "submitted",
+      meta_response: resp.data
+    });
+
+  } catch (err) {
+    console.error("Error create template:", err.response?.data || err.message);
+    return res.status(500).json({
+      status: "error",
+      error: err.response?.data || err.message
+    });
   }
 });
 
