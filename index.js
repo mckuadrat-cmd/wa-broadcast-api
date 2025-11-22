@@ -94,15 +94,19 @@ app.post("/broadcast", async (req, res) => {
 app.post("/templates/create", async (req, res) => {
   try {
     const {
-      name,        // contoh: "kirim_hasil_test_pesat"
-      category,    // "UTILITY" atau "MARKETING"
-      language,    // "id"
-      body_text,   // teks template, boleh ada {{1}}
-      example_1    // contoh isi {{1}} (opsional, tapi bagus ada)
+      name,          // contoh: "kirim_hasil_test_pesat"
+      category,      // "UTILITY" atau "MARKETING"
+      body_text,     // teks body, boleh ada {{1}}
+      example_1,     // sample isi {{1}} (opsional)
+      footer_text,   // teks footer (opsional)
+      buttons        // array string button text (opsional)
     } = req.body;
 
-    if (!name || !category || !language || !body_text) {
-      return res.status(400).json({ error: "name, category, language, body_text wajib diisi" });
+    // language kita kunci sebagai English (en_US)
+    const language = "en_US";
+
+    if (!name || !category || !body_text) {
+      return res.status(400).json({ error: "name, category, body_text wajib diisi" });
     }
 
     if (!WABA_ID || !WA_TOKEN) {
@@ -111,19 +115,46 @@ app.post("/templates/create", async (req, res) => {
 
     const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
 
+    const components = [];
+
+    // BODY (WAJIB)
+    const bodyComponent = {
+      type: "BODY",
+      text: body_text
+    };
+    if (example_1) {
+      bodyComponent.example = { body_text: [[example_1]] };
+    }
+    components.push(bodyComponent);
+
+    // FOOTER (OPSIONAL)
+    if (footer_text && footer_text.trim().length > 0) {
+      components.push({
+        type: "FOOTER",
+        text: footer_text.trim()
+      });
+    }
+
+    // BUTTONS (OPSIONAL – Quick Reply)
+    const btnArray = Array.isArray(buttons)
+      ? buttons.filter(b => typeof b === "string" && b.trim().length > 0)
+      : [];
+
+    if (btnArray.length > 0) {
+      components.push({
+        type: "BUTTONS",
+        buttons: btnArray.map((text, idx) => ({
+          type: "QUICK_REPLY",
+          text: text.trim()
+        }))
+      });
+    }
+
     const payload = {
-      name,          // harus huruf kecil + underscore
-      category,      // "UTILITY" / "MARKETING"
-      language,      // "id"
-      components: [
-        {
-          type: "BODY",
-          text: body_text,
-          ...(example_1
-            ? { example: { body_text: [[example_1]] } }
-            : {})
-        }
-      ]
+      name,       // harus lowercase + underscore, diatur dari frontend
+      category,
+      language,
+      components
     };
 
     const resp = await axios.post(url, payload, {
@@ -135,6 +166,7 @@ app.post("/templates/create", async (req, res) => {
 
     return res.json({
       status: "submitted",
+      payload_sent: payload,
       meta_response: resp.data
     });
 
