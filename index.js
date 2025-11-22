@@ -134,6 +134,52 @@ app.post("/templates/create", async (req, res) => {
   }
 });
 
+app.get("/templates", async (req, res) => {
+  try {
+    if (!WABA_ID || !WA_TOKEN) {
+      return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
+    }
+
+    // bisa pakai query ?status=APPROVED kalau mau
+    const status = req.query.status || "APPROVED";
+
+    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates?status=${encodeURIComponent(status)}`;
+
+    const resp = await axios.get(url, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`
+      }
+    });
+
+    // Meta biasanya balas { data: [ {name, category, language, status, ...}, ... ], paging: {...} }
+
+    const templates = Array.isArray(resp.data?.data) ? resp.data.data : [];
+
+    // Biar frontend sederhana, kita kirim versi ringkas
+    const simplified = templates.map(t => ({
+      name: t.name,
+      category: t.category,
+      language: t.language,
+      status: t.status,
+      id: t.id,
+      components: t.components
+    }));
+
+    return res.json({
+      status: "ok",
+      count: simplified.length,
+      templates: simplified
+    });
+
+  } catch (err) {
+    console.error("Error get templates:", err.response?.data || err.message);
+    return res.status(500).json({
+      status: "error",
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 async function sendWaTemplate({ phone, templateName, vars }) {
   const url = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
 
