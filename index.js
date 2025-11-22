@@ -102,8 +102,8 @@ app.post("/templates/create", async (req, res) => {
       buttons        // array string button text (opsional)
     } = req.body;
 
-    // language kita kunci sebagai English (en_US)
-    const language = "en_US";
+    // language kita kunci sebagai English (en)
+    const language = "en";
 
     if (!name || !category || !body_text) {
       return res.status(400).json({ error: "name, category, body_text wajib diisi" });
