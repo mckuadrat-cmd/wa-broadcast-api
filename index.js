@@ -91,70 +91,40 @@ app.post("/broadcast", async (req, res) => {
 });
 
 // ====== AJUKAN TEMPLATE BARU ======
-  <!-- CARD: Ajukan Template -->
-  <div class="card">
-    <h2>2. Ajukan Template WhatsApp Baru</h2>
-    <div class="section-note">
-      Template akan diajukan ke Meta. Setelah berstatus <strong>APPROVED</strong>, akan otomatis muncul di dropdown di atas.<br>
-      <strong>Language:</strong> English (<code>en</code>) – dibuat otomatis.
-    </div>
+app.post("/templates/create", async (req, res) => {
+  try {
+    const {
+      name,        // contoh: "kirim_hasil_test_pesat"
+      category,    // "UTILITY" atau "MARKETING"
+      language,    // "id"
+      body_text,   // teks template, boleh ada {{1}}
+      example_1    // contoh isi {{1}} (opsional, tapi bagus ada)
+    } = req.body;
 
-    <label>
-      Nama Template WhatsApp
-      <small>Huruf kecil + underscore. Contoh: <code>kirim_hasil_test_pesat</code></small>
-      <input type="text" id="tpl_name" placeholder="kirim_hasil_test_pesat">
-    </label>
+    if (!name || !category || !language || !body_text) {
+      return res.status(400).json({ error: "name, category, language, body_text wajib diisi" });
+    }
 
-    <label>
-      Kategori Template
-      <select id="tpl_category">
-        <option value="UTILITY">UTILITY (notifikasi / hasil tes)</option>
-        <option value="MARKETING">MARKETING (promo / open house)</option>
-      </select>
-    </label>
+    if (!WABA_ID || !WA_TOKEN) {
+      return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
+    }
 
-    <label>
-      Type of variable (untuk isi {{1}})
-      <select id="tpl_var_type">
-        <option value="text">Text (nama, kalimat)</option>
-        <option value="number">Number (kode, angka)</option>
-      </select>
-    </label>
+    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
 
-    <label>
-      Body Template
-      <small>
-        Bisa gunakan placeholder <code>{{1}}</code>, <code>{{2}}</code>, dst.<br>
-        Contoh:<br>
-        <code>Hello {{1}}, here is your test result from MCKuadrat.</code>
-      </small>
-      <textarea id="tpl_body" placeholder="Hello {{1}}, here is your test result from MCKuadrat."></textarea>
-    </label>
-
-    <label>
-      Contoh isi {{1}} (Sample untuk Meta)
-      <small>Contoh: <code>Mr. / Mrs. Ridwan</code> atau <code>123456</code> kalau type Number.</small>
-      <input type="text" id="tpl_example1" placeholder="Mr. / Mrs. Ridwan">
-    </label>
-
-    <label>
-      Footer (optional)
-      <small>Contoh: <code>Powered by MCKuadrat</code> atau catatan singkat lainnya.</small>
-      <input type="text" id="tpl_footer" placeholder="Powered by MCKuadrat">
-    </label>
-
-    <label>
-      Buttons (optional, Quick Reply)
-      <small>Maksimal 3 tombol. Kosongkan kalau tidak perlu.</small>
-      <input type="text" id="tpl_btn1" placeholder="Contoh: YES" />
-      <input type="text" id="tpl_btn2" placeholder="Contoh: NO" style="margin-top:6px;" />
-      <input type="text" id="tpl_btn3" placeholder="Contoh: MORE INFO" style="margin-top:6px;" />
-    </label>
-
-    <button id="btnCreateTpl">Ajukan Template ke Meta</button>
-
-    <pre id="tplResult">// Respon pengajuan template akan muncul di sini</pre>
-  </div>
+    const payload = {
+      name,          // harus huruf kecil + underscore
+      category,      // "UTILITY" / "MARKETING"
+      language,      // "id"
+      components: [
+        {
+          type: "BODY",
+          text: body_text,
+          ...(example_1
+            ? { example: { body_text: [[example_1]] } }
+            : {})
+        }
+      ]
+    };
 
     const resp = await axios.post(url, payload, {
       headers: {
@@ -230,7 +200,7 @@ async function sendWaTemplate({ phone, templateName, vars }) {
     template: {
       name: templateName,
       // SESUAIKAN dengan bahasa template di Meta (id, en_US, dll)
-      language: { code: "en" },
+      language: { code: "id" },
       components: [
         {
           type: "body",
