@@ -12,11 +12,11 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;  // phone number id WA Clou
 // ====== APP SETUP ======
 const app = express();
 
-// CORS (boleh diakses dari app.mckuadrat.com)
-app.use(cors());
+// Baca JSON body
 app.use(express.json());
 
-// CORS OPTIONS preflight (tambahan, kalau perlu)
+// CORS (boleh diakses dari app.mckuadrat.com)
+app.use(cors());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -199,7 +199,8 @@ async function sendWaTemplate({ phone, templateName, vars }) {
     type: "template",
     template: {
       name: templateName,
-      language: { code: "id" }, // SESUAIKAN dengan bahasa template di Meta
+      // SESUAIKAN dengan bahasa template di Meta (id, en_US, dll)
+      language: { code: "id" },
       components: [
         {
           type: "body",
