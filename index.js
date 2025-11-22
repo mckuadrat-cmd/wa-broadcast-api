@@ -1,21 +1,24 @@
-import express from "express";
-import fileUpload from "express-fileupload";
-
+// ====== IMPORT MODULE ======
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");   // <===== ini wajib
+const axios = require("axios");
 
-const WABA_ID    = process.env.WABA_ID;
-const WA_TOKEN   = process.env.WA_TOKEN;   // nama ENV ngikut punya lu
-const WA_VERSION = process.env.WA_VERSION || "v20.0";
+// ====== ENV VARS ======
+const WABA_ID = process.env.WABA_ID;                  // WhatsApp Business Account ID
+const WA_TOKEN = process.env.WA_TOKEN;                // Access token Meta
+const WA_VERSION = process.env.WA_VERSION || "v20.0"; // versi Graph API
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;  // phone number id WA Cloud
 
+// ====== APP SETUP ======
 const app = express();
-app.use(express.json());
-app.use(fileUpload());
 
-// ====== CORS SIMPLE (BIAR BISA DIPANGGIL DARI HTML / DOMAIN LAIN) ======
+// CORS (boleh diakses dari app.mckuadrat.com)
+app.use(cors());
+app.use(express.json());
+
+// CORS OPTIONS preflight (tambahan, kalau perlu)
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // boleh dari mana saja
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
@@ -24,69 +27,78 @@ app.use((req, res, next) => {
   next();
 });
 
-// Cek hidup
+// ====== HEALTHCHECK ======
 app.get("/", (req, res) => {
   res.send("MCKuadrat WA Broadcast API — ONLINE ✅");
 });
 
-// POST /broadcast
-// Body: form-data -> templateName (text), csv (file)
-// CSV format: no_wa,var1,var2,var3,...
+// ====== BROADCAST (JSON, BUKAN FILE UPLOAD) ======
+// Body JSON:
+// {
+//   "template_name": "kirim_hasil_test",
+//   "rows": [
+//     { "phone": "62823xxxx", "var1": "Bapak/Ibu Ridwan" },
+//     { "phone": "62812xxxx", "var1": "Bapak/Ibu Budi" }
+//   ]
+// }
 app.post("/broadcast", async (req, res) => {
   try {
-    const templateName = req.body.templateName;
-    const file = req.files?.csv;
+    const { template_name, rows } = req.body;
 
-    if (!templateName) {
-      return res.status(400).json({ error: "templateName wajib diisi" });
+    if (!template_name) {
+      return res.status(400).json({ error: "template_name wajib diisi" });
     }
-    if (!file) {
-      return res.status(400).json({ error: "File CSV wajib diupload sebagai field `csv`" });
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ error: "rows wajib berupa array dengan minimal 1 item" });
     }
-
-    const text = file.data.toString("utf-8").trim();
-    if (!text) {
-      return res.status(400).json({ error: "Isi CSV kosong" });
+    if (!PHONE_NUMBER_ID || !WA_TOKEN) {
+      return res.status(500).json({ error: "PHONE_NUMBER_ID atau WA_TOKEN belum diset di server" });
     }
 
-    const lines = text.split(/\r?\n/).filter(l => l.trim() !== "");
     const results = [];
 
-    for (const line of lines) {
-      const cols = line.split(",").map(c => c.trim());
-      if (!cols[0]) continue; // skip baris tanpa nomor
+    for (const row of rows) {
+      const phone = String(row.phone || "").trim();
+      const var1  = String(row.var1  || "").trim(); // saat ini cuma dukung {{1}}
 
-      const phone = cols[0];
-      const vars = cols.slice(1); // bisa 1 variabel, 2, 3, dst.
+      if (!phone) {
+        results.push({ phone: null, ok: false, error: "no phone", raw: row });
+        continue;
+      }
 
       const r = await sendWaTemplate({
         phone,
-        templateName,
-        vars,
+        templateName: template_name,
+        vars: [var1]
       });
 
       results.push(r);
     }
 
-    res.json({
-      ok: true,
+    return res.json({
+      status: "ok",
+      template_name,
       count: results.length,
-      results,
+      results
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error", detail: String(err) });
+    console.error("Error /broadcast:", err);
+    return res.status(500).json({
+      status: "error",
+      error: String(err)
+    });
   }
 });
 
+// ====== AJUKAN TEMPLATE BARU ======
 app.post("/templates/create", async (req, res) => {
   try {
     const {
-      name,        // contoh: "kirim_hasil_test"
+      name,        // contoh: "kirim_hasil_test_pesat"
       category,    // "UTILITY" atau "MARKETING"
       language,    // "id"
       body_text,   // teks template, boleh ada {{1}}
-      example_1    // contoh isi {{1}} biar Meta gampang approve (opsional)
+      example_1    // contoh isi {{1}} (opsional, tapi bagus ada)
     } = req.body;
 
     if (!name || !category || !language || !body_text) {
@@ -99,16 +111,14 @@ app.post("/templates/create", async (req, res) => {
 
     const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
 
-    // payload minimal: 1 body component
     const payload = {
-      name,          // harus huruf kecil + underscore sesuai aturan Meta
+      name,          // harus huruf kecil + underscore
       category,      // "UTILITY" / "MARKETING"
       language,      // "id"
       components: [
         {
           type: "BODY",
           text: body_text,
-          // example boleh dikosongkan, tapi bagusnya diisi:
           ...(example_1
             ? { example: { body_text: [[example_1]] } }
             : {})
@@ -123,14 +133,13 @@ app.post("/templates/create", async (req, res) => {
       }
     });
 
-    // Meta biasanya balas dengan id template atau detail status
     return res.json({
       status: "submitted",
       meta_response: resp.data
     });
 
   } catch (err) {
-    console.error("Error create template:", err.response?.data || err.message);
+    console.error("Error /templates/create:", err.response?.data || err.message);
     return res.status(500).json({
       status: "error",
       error: err.response?.data || err.message
@@ -138,15 +147,14 @@ app.post("/templates/create", async (req, res) => {
   }
 });
 
+// ====== AMBIL DAFTAR TEMPLATE (APPROVED) ======
 app.get("/templates", async (req, res) => {
   try {
     if (!WABA_ID || !WA_TOKEN) {
       return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
     }
 
-    // bisa pakai query ?status=APPROVED kalau mau
     const status = req.query.status || "APPROVED";
-
     const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates?status=${encodeURIComponent(status)}`;
 
     const resp = await axios.get(url, {
@@ -155,11 +163,8 @@ app.get("/templates", async (req, res) => {
       }
     });
 
-    // Meta biasanya balas { data: [ {name, category, language, status, ...}, ... ], paging: {...} }
-
     const templates = Array.isArray(resp.data?.data) ? resp.data.data : [];
 
-    // Biar frontend sederhana, kita kirim versi ringkas
     const simplified = templates.map(t => ({
       name: t.name,
       category: t.category,
@@ -176,7 +181,7 @@ app.get("/templates", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Error get templates:", err.response?.data || err.message);
+    console.error("Error /templates:", err.response?.data || err.message);
     return res.status(500).json({
       status: "error",
       error: err.response?.data || err.message
@@ -184,48 +189,59 @@ app.get("/templates", async (req, res) => {
   }
 });
 
+// ====== HELPER: KIRIM TEMPLATE WA ======
 async function sendWaTemplate({ phone, templateName, vars }) {
-  const url = `https://graph.facebook.com/v21.0/${process.env.PHONE_NUMBER_ID}/messages`;
+  const url = `https://graph.facebook.com/${WA_VERSION}/${PHONE_NUMBER_ID}/messages`;
 
-  const body = {
+  const payload = {
     messaging_product: "whatsapp",
     to: phone,
     type: "template",
     template: {
       name: templateName,
-      language: { code: "en" }, // sesuaikan dengan template WA-mu
+      language: { code: "id" }, // SESUAIKAN dengan bahasa template di Meta
       components: [
         {
           type: "body",
           parameters: (vars && vars.length > 0 ? vars : [""]).map(v => ({
             type: "text",
-            text: String(v ?? ""),
-          })),
-        },
-      ],
-    },
+            text: String(v ?? "")
+          }))
+        }
+      ]
+    }
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.WA_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  try {
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    });
 
-  const data = await resp.json();
+    const data = resp.data;
 
-  return {
-    phone,
-    ok: resp.ok,
-    status: resp.status,
-    messageId: data?.messages?.[0]?.id ?? null,
-    error: resp.ok ? null : data,
-  };
+    return {
+      phone,
+      ok: true,
+      status: resp.status,
+      messageId: data?.messages?.[0]?.id ?? null,
+      error: null
+    };
+  } catch (err) {
+    const data = err.response?.data || err.message;
+    return {
+      phone,
+      ok: false,
+      status: err.response?.status || 500,
+      messageId: null,
+      error: data
+    };
+  }
 }
 
+// ====== START SERVER ======
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("WA Broadcast API running on port", PORT);
