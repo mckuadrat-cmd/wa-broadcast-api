@@ -1,6 +1,10 @@
 import express from "express";
 import fileUpload from "express-fileupload";
 
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");   // <===== ini wajib
+
 const WABA_ID    = process.env.WABA_ID;
 const WA_TOKEN   = process.env.WA_TOKEN;   // nama ENV ngikut punya lu
 const WA_VERSION = process.env.WA_VERSION || "v20.0";
