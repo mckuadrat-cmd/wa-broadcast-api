@@ -12,6 +12,14 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;  // phone number id WA Clou
 // ====== APP SETUP ======
 const app = express();
 
+const router = express.Router();
+
+router.get("/templates", ... );
+router.post("/broadcast", ... );
+router.post("/templates/create", ... );
+
+app.use("/kirimpesan", router);
+
 // Baca JSON body
 app.use(express.json());
 
