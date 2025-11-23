@@ -202,6 +202,44 @@ app.post(BASE_PATH + "/templates/create", async (req, res) => {
   }
 });
 
+// ====== GET /kirimpesan/senders ======
+// Ambil daftar phone_number dari WABA via Graph API
+app.get("/kirimpesan/senders", async (req, res) => {
+  try {
+    if (!WABA_ID || !WA_TOKEN) {
+      return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
+    }
+
+    const url =
+      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/phone_numbers` +
+      `?fields=id,display_phone_number,verified_name`;
+
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` }
+    });
+
+    const rows = Array.isArray(resp.data?.data) ? resp.data.data : [];
+
+    const senders = rows.map((r) => ({
+      phone_number_id: r.id,
+      phone: r.display_phone_number,
+      name: r.verified_name || r.display_phone_number
+    }));
+
+    res.json({
+      status: "ok",
+      count: senders.length,
+      senders
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/senders:", err.response?.data || err.message);
+    res.status(500).json({
+      status: "error",
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 // ----------------------
 // POST /kirimpesan/broadcast
 // body: { template_name, rows: [{phone, var1}], sender_id? }
@@ -265,8 +303,10 @@ app.post(BASE_PATH + "/broadcast", async (req, res) => {
 // ----------------------
 // Helper kirim WA template
 // ----------------------
-async function sendWaTemplate({ phone, templateName, vars, phoneNumberId }) {
-  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
+  const phoneId = phone_number_id || process.env.PHONE_NUMBER_ID; // fallback ke default
+
+  const url = `https://graph.facebook.com/v21.0/${phoneId}/messages`;
 
   const body = {
     messaging_product: "whatsapp",
@@ -274,26 +314,26 @@ async function sendWaTemplate({ phone, templateName, vars, phoneNumberId }) {
     type: "template",
     template: {
       name: templateName,
-      language: { code: "en" }, // sama dengan yang kita pakai di template
+      language: { code: "en" }, // atau "id" sesuai template
       components: [
         {
           type: "body",
-          parameters: (vars && vars.length ? vars : [""]).map((v) => ({
+          parameters: (vars && vars.length > 0 ? vars : [""]).map(v => ({
             type: "text",
-            text: String(v ?? ""),
-          })),
-        },
-      ],
-    },
+            text: String(v ?? "")
+          }))
+        }
+      ]
+    }
   };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.WA_TOKEN}`,
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
 
   const data = await resp.json();
@@ -303,7 +343,7 @@ async function sendWaTemplate({ phone, templateName, vars, phoneNumberId }) {
     ok: resp.ok,
     status: resp.status,
     messageId: data?.messages?.[0]?.id ?? null,
-    error: resp.ok ? null : data,
+    error: resp.ok ? null : data
   };
 }
 
