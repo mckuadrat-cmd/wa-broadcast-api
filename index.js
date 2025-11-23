@@ -232,7 +232,7 @@ async function sendWaTemplate({ phone, templateName, vars }) {
     template: {
       name: templateName,
       // SESUAIKAN dengan bahasa template di Meta (id, en_US, dll)
-      language: { code: "id" },
+      language: { code: "en" },
       components: [
         {
           type: "body",
