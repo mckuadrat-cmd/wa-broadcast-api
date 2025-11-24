@@ -353,6 +353,97 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
   }
 });
 
+// =======================================================
+// 6) POST /kirimpesan/custom
+//    Kirim pesan bebas (text + optional media)
+//    Body JSON:
+//    {
+//      "to": "62812....",
+//      "text": "Terima kasih sudah bersedia...",
+//      "media": {
+//        "type": "document" | "image" | "audio" | "video",
+//        "link": "https://...."
+//      }
+//    }
+//
+//  Ini yang akan dipanggil webhook setelah user klik quick reply.
+// =======================================================
+app.post("/kirimpesan/custom", async (req, res) => {
+  try {
+    const { to, text, media } = req.body || {};
+
+    if (!to) {
+      return res.status(400).json({ status: "error", error: "`to` (nomor tujuan) wajib diisi" });
+    }
+    if (!text && !media) {
+      return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
+    }
+
+    // tentukan PHONE_NUMBER_ID yang dipakai
+    const phoneId = process.env.PHONE_NUMBER_ID;
+    if (!phoneId) {
+      return res.status(500).json({ status: "error", error: "PHONE_NUMBER_ID belum diset di server" });
+    }
+
+    const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
+
+    // bangun payload dasar
+    let body;
+
+    if (media && media.type && media.link) {
+      // kirim message dengan lampiran + caption
+      // type bisa: document, image, video, audio (sesuai WA Cloud API)
+      const mType = media.type.toLowerCase();
+
+      const baseMediaPayload = {
+        link: media.link
+      };
+
+      // caption (text) kalau ada
+      if (text) {
+        baseMediaPayload.caption = text;
+      }
+
+      body = {
+        messaging_product: "whatsapp",
+        to,
+        type: mType,
+        [mType]: baseMediaPayload
+      };
+    } else {
+      // text only
+      body = {
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: {
+          preview_url: false,
+          body: text
+        }
+      };
+    }
+
+    const resp = await axios.post(url, body, {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    res.json({
+      status: "ok",
+      to,
+      wa_response: resp.data
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
+    res.status(500).json({
+      status: "error",
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 // ====== START SERVER ======
 app.listen(PORT, () => {
   console.log("WA Broadcast API running on port", PORT);
