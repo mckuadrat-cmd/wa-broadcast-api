@@ -26,24 +26,31 @@ app.get("/", (req, res) => {
 });
 
 // =======================================================
+// HELPER: ambil daftar phone_numbers dari WABA
+// =======================================================
+async function getWabaPhoneNumbers() {
+  if (!WABA_ID || !WA_TOKEN) {
+    throw new Error("WABA_ID atau WA_TOKEN belum diset di server");
+  }
+
+  const url =
+    `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/phone_numbers` +
+    `?fields=id,display_phone_number,verified_name`;
+
+  const resp = await axios.get(url, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` }
+  });
+
+  return Array.isArray(resp.data?.data) ? resp.data.data : [];
+}
+
+// =======================================================
 // 1) GET /kirimpesan/senders
 //    Ambil daftar phone_number dari WABA (untuk dropdown Sender Number)
 // =======================================================
 app.get("/kirimpesan/senders", async (req, res) => {
   try {
-    if (!WABA_ID || !WA_TOKEN) {
-      return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
-    }
-
-    const url =
-      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/phone_numbers` +
-      `?fields=id,display_phone_number,verified_name`;
-
-    const resp = await axios.get(url, {
-      headers: { Authorization: `Bearer ${WA_TOKEN}` }
-    });
-
-    const rows = Array.isArray(resp.data?.data) ? resp.data.data : [];
+    const rows = await getWabaPhoneNumbers();
 
     const senders = rows.map((r) => ({
       phone_number_id: r.id,
@@ -201,7 +208,7 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
 //    arg: { phone, templateName, vars, phone_number_id }
 // =======================================================
 async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
-  // kalau frontend kirim phone_number_id → pakai itu,
+  // kalau backend dikirimi phone_number_id → pakai itu,
   // kalau tidak, fallback ke PHONE_NUMBER_ID default di env
   const phoneId = phone_number_id || process.env.PHONE_NUMBER_ID;
   if (!phoneId) {
@@ -252,16 +259,17 @@ async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
 //    Body JSON:
 //    {
 //      template_name: "kirim_hasil_test",
-//      phone_number_id: "1234567890", // optional
+//      sender_phone: "62851....",        // optional, dari dashboard (display number)
+//      phone_number_id: "1234567890",    // optional, kalau mau kirim ID langsung
 //      rows: [
-//        { phone: "62812...", var1: "Ridwan", vars: ["Ridwan", "1234", "link"] },
+//        { phone: "62812...", var1: "Ridwan", var2: "1234", ... },
 //        ...
 //      ]
 //    }
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
   try {
-    const { template_name, rows, phone_number_id } = req.body || {};
+    const { template_name, rows, phone_number_id, sender_phone } = req.body || {};
 
     if (!template_name) {
       return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
@@ -270,20 +278,44 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
     }
 
+    let effectivePhoneId = phone_number_id || null;
+
+    // Kalau tidak ada phone_number_id tapi ada sender_phone (display number),
+    // coba mapping ke id lewat Graph API.
+    if (!effectivePhoneId && sender_phone) {
+      try {
+        const phones = await getWabaPhoneNumbers();
+        const match = phones.find(
+          (p) => String(p.display_phone_number).replace(/\s+/g, "") === String(sender_phone).replace(/\s+/g, "")
+        );
+        if (match) {
+          effectivePhoneId = match.id;
+        } else {
+          console.warn("sender_phone tidak ditemukan di WABA:", sender_phone);
+        }
+      } catch (e) {
+        console.warn("Gagal resolve sender_phone → phone_number_id:", e.message);
+      }
+    }
+
     const results = [];
 
     for (const row of rows) {
       const phone = row.phone || row.to;
       if (!phone) continue;
 
-      // vars boleh dikirim langsung (row.vars) atau diambil dari var1,var2,...
+      // vars boleh dikirim langsung (row.vars) atau diambil dari var1,var2,var3,... dinamis
       let vars = row.vars;
       if (!Array.isArray(vars)) {
-        const tmp = [];
-        if (row.var1) tmp.push(row.var1);
-        if (row.var2) tmp.push(row.var2);
-        if (row.var3) tmp.push(row.var3);
-        vars = tmp;
+        const varKeys = Object.keys(row)
+          .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
+          .sort((a, b) => {
+            const na = parseInt(a.replace("var", ""), 10);
+            const nb = parseInt(b.replace("var", ""), 10);
+            return na - nb;
+          });
+
+        vars = varKeys.map((k) => row[k]);
       }
 
       try {
@@ -291,7 +323,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           phone,
           templateName: template_name,
           vars,
-          phone_number_id
+          phone_number_id: effectivePhoneId
         });
         results.push(r);
       } catch (err) {
