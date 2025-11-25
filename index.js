@@ -10,9 +10,12 @@ const app = express();
 
 const { Pool } = require("pg");
 
+// Pool Postgres (Railway)
 const pgPool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // biasanya perlu di Railway
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 // ====== CONFIG DARI ENV ======
@@ -40,9 +43,6 @@ const PORT = process.env.PORT || 3000;
 let lastFollowupConfig = null;
 // Menyimpan mapping nomor → row broadcast terakhir (untuk var & attachment per-orang)
 let lastBroadcastRowsByPhone = {};
-// Menyimpan riwayat broadcast (in-memory)
-let broadcastLogs = [];   // [{ id, created_at, template_name, sender_phone, phone_number_id, followup_enabled, rows, results, followups }]
-let lastBroadcastId = null;
 
 // ====== MIDDLEWARE ======
 app.use(cors());
@@ -332,21 +332,7 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 }
 
 // =======================================================
-// 6) POST /kirimpesan/broadcast
-//    Body JSON:
-//    {
-//      template_name: "kirim_hasil_test",
-//      sender_phone: "62851....",        // optional: display number dari dropdown
-//      phone_number_id: "1234567890",    // optional: kalau mau kirim ID langsung
-//      rows: [
-//        { phone: "62812...", var1: "Ridwan", var2: "1234", follow_media: "https://..." },
-//        ...
-//      ],
-//      followup: {
-//        text: "Terima kasih, {{1}} ...",
-//        static_media: { type: "document", link: "https://..." }
-//      }
-//    }
+// 6) POST /kirimpesan/broadcast  (VERSI PAKAI POSTGRES)
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
   try {
@@ -374,8 +360,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
     // Buat ID unik untuk broadcast ini
     const broadcastId =
       Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
-    lastBroadcastId = broadcastId;
 
+    // Resolve phone_number_id kalau cuma kirim sender_phone
     let effectivePhoneId = phone_number_id || null;
 
     if (!effectivePhoneId && sender_phone) {
@@ -396,20 +382,37 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       }
     }
 
+    // --- 2. Simpan broadcast ke Postgres ---
+    await pgPool.query(
+      `INSERT INTO broadcasts (
+        id, created_at, template_name, sender_phone, phone_number_id, followup_enabled
+      ) VALUES ($1, NOW(), $2, $3, $4, $5)`,
+      [
+        broadcastId,
+        template_name,
+        sender_phone || null,
+        effectivePhoneId || null,
+        !!(followup && followup.text)
+      ]
+    );
+
     const results = [];
 
+    // --- 3. Loop tiap row penerima ---
     for (const row of rows) {
       const phone = row.phone || row.to;
       if (!phone) continue;
 
-      // Simpan mapping nomor → row + broadcastId (dipakai webhook)
+      // Simpan mapping nomor → row + broadcastId (dipakai webhook untuk isi {{1}},{{2}},...)
       lastBroadcastRowsByPhone[String(phone)] = {
         row,
         broadcastId
       };
 
-      // vars boleh dikirim langsung (row.vars) atau diambil dari var1,var2,...
+      // Ambil vars dari row (row.vars atau var1,var2,...)
       let vars = row.vars;
+      const varsMap = {}; // { var1: "...", var2: "..." }
+
       if (!Array.isArray(vars)) {
         const varKeys = Object.keys(row)
           .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
@@ -419,46 +422,82 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
             return na - nb;
           });
 
-        vars = varKeys.map((k) => row[k]);
+        vars = varKeys.map((k) => {
+          varsMap[k] = row[k];
+          return row[k];
+        });
+      } else {
+        // kalau sudah ada row.vars (array), kita simpan ke varsMap sebagai var1, var2, ...
+        vars.forEach((v, idx) => {
+          varsMap["var" + (idx + 1)] = v;
+        });
       }
 
+      // follow_media per-orang (kolom terakhir CSV)
+      const followMedia = row.follow_media || null;
+
       try {
+        // --- 4. Kirim template ke WA ---
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
           vars,
           phone_number_id: effectivePhoneId,
         });
+
         results.push(r);
+
+        // --- 5. Simpan result ke broadcast_recipients ---
+        await pgPool.query(
+          `INSERT INTO broadcast_recipients (
+             broadcast_id, phone, vars_json, follow_media,
+             template_ok, template_http_status, template_error, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+          [
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            followMedia,
+            true,
+            r.status || null,
+            null
+          ]
+        );
       } catch (err) {
         console.error("Broadcast error for", phone, err.response?.data || err.message);
+
+        const errorPayload = err.response?.data || err.message;
+
         results.push({
           phone,
           ok: false,
           status: err.response?.status || 500,
           messageId: null,
-          error: err.response?.data || err.message,
+          error: errorPayload,
         });
+
+        await pgPool.query(
+          `INSERT INTO broadcast_recipients (
+             broadcast_id, phone, vars_json, follow_media,
+             template_ok, template_http_status, template_error, created_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+          [
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            followMedia,
+            false,
+            err.response?.status || null,
+            typeof errorPayload === "string" ? { message: errorPayload } : errorPayload
+          ]
+        );
       }
     }
 
     // Ringkasan
-    const total = results.length;
-    const ok = results.filter((r) => r.ok).length;
+    const total  = results.length;
+    const ok     = results.filter((r) => r.ok).length;
     const failed = total - ok;
-
-    // Simpan log ke memory
-    broadcastLogs.push({
-      id: broadcastId,
-      created_at: new Date().toISOString(),
-      template_name,
-      sender_phone: sender_phone || null,
-      phone_number_id: effectivePhoneId || null,
-      followup_enabled: !!(followup && followup.text),
-      rows,
-      results,
-      followups: []    // akan diisi oleh webhook
-    });
 
     res.json({
       status: "ok",
@@ -610,8 +649,8 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       }
     
       // Ambil row broadcast terakhir untuk nomor ini (kalau ada)
-      const mapEntry = lastBroadcastRowsByPhone[String(from)] || null;
-      const row = mapEntry ? mapEntry.row : null;
+      const mapEntry   = lastBroadcastRowsByPhone[String(from)] || null;
+      const row        = mapEntry ? mapEntry.row : null;
       const broadcastId = mapEntry ? mapEntry.broadcastId : null;
     
       // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ...
@@ -643,40 +682,49 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       try {
         const data = await sendCustomMessage(payload);
         console.log("Follow-up sent:", JSON.stringify(data, null, 2));
-    
-        // Catat ke log broadcast kalau ketemu
+
+        // Catat ke Postgres
         if (broadcastId) {
-          const log = broadcastLogs.find((l) => l.id === broadcastId);
-          if (log) {
-            log.followups = log.followups || [];
-            log.followups.push({
-              phone: from,
+          await pgPool.query(
+            `INSERT INTO broadcast_followups (
+               broadcast_id, phone, text, has_media, media_link,
+               status, error, at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              broadcastId,
+              from,
               text,
-              has_media: !!media,
-              media_link: media ? media.link : null,
-              status: "ok",
-              wa_response: data,
-              at: new Date().toISOString()
-            });
-          }
+              !!media,
+              media ? media.link : null,
+              "ok",
+              null,
+              new Date().toISOString()
+            ]
+          );
         }
       } catch (err) {
         console.error("Error sending follow-up:", err.response?.data || err.message);
-    
+
         if (broadcastId) {
-          const log = broadcastLogs.find((l) => l.id === broadcastId);
-          if (log) {
-            log.followups = log.followups || [];
-            log.followups.push({
-              phone: from,
+          const errorPayload = err.response?.data || err.message;
+          await pgPool.query(
+            `INSERT INTO broadcast_followups (
+               broadcast_id, phone, text, has_media, media_link,
+               status, error, at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              broadcastId,
+              from,
               text,
-              has_media: !!media,
-              media_link: media ? media.link : null,
-              status: "error",
-              error: err.response?.data || err.message,
-              at: new Date().toISOString()
-            });
-          }
+              !!media,
+              media ? media.link : null,
+              "error",
+              typeof errorPayload === "string"
+                ? { message: errorPayload }
+                : errorPayload,
+              new Date().toISOString()
+            ]
+          );
         }
       }
     }
@@ -691,146 +739,204 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 });
 
 // =======================================================
-// 9) LOG BROADCAST (IN-MEMORY)
+// 9) LOG BROADCAST (POSTGRES)
 // =======================================================
 
 // Ringkasan semua log (urutan terbaru dulu)
 // GET /kirimpesan/broadcast/logs?limit=20
-app.get("/kirimpesan/broadcast/logs", (req, res) => {
-  const limit = parseInt(req.query.limit || "50", 10);
+app.get("/kirimpesan/broadcast/logs", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || "50", 10);
 
-  const sorted = [...broadcastLogs].sort(
-    (a, b) => new Date(b.created_at) - new Date(a.created_at)
-  );
+    const sql = `
+      SELECT
+        b.id,
+        b.created_at,
+        b.template_name,
+        b.sender_phone,
+        b.followup_enabled,
+        COUNT(br.id) AS total,
+        COALESCE(SUM(CASE WHEN br.template_ok = TRUE  THEN 1 ELSE 0 END),0) AS ok,
+        COALESCE(SUM(CASE WHEN br.template_ok = FALSE THEN 1 ELSE 0 END),0) AS failed,
+        COUNT(DISTINCT bf.id) AS followup_count
+      FROM broadcasts b
+      LEFT JOIN broadcast_recipients br ON br.broadcast_id = b.id
+      LEFT JOIN broadcast_followups bf  ON bf.broadcast_id = b.id
+      GROUP BY b.id
+      ORDER BY b.created_at DESC
+      LIMIT $1
+    `;
 
-  const sliced = sorted.slice(0, limit).map((l) => ({
-    id: l.id,
-    created_at: l.created_at,
-    template_name: l.template_name,
-    sender_phone: l.sender_phone,
-    followup_enabled: l.followup_enabled,
-    total: l.results.length,
-    ok: l.results.filter((r) => r.ok).length,
-    failed: l.results.filter((r) => !r.ok).length,
-    followup_count: (l.followups || []).length
-  }));
+    const { rows } = await pgPool.query(sql, [limit]);
 
-  res.json({
-    status: "ok",
-    count: sliced.length,
-    logs: sliced
-  });
+    res.json({
+      status: "ok",
+      count: rows.length,
+      logs: rows
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/logs:", err);
+    res.status(500).json({ status: "error", error: String(err) });
+  }
 });
 
 // Detail satu log
 // GET /kirimpesan/broadcast/logs/:id
-app.get("/kirimpesan/broadcast/logs/:id", (req, res) => {
+app.get("/kirimpesan/broadcast/logs/:id", async (req, res) => {
   const id = req.params.id;
-  const log = broadcastLogs.find((l) => l.id === id);
-  if (!log) {
-    return res.status(404).json({ status: "error", error: "Log not found" });
+  try {
+    const bRes = await pgPool.query(
+      "SELECT * FROM broadcasts WHERE id = $1",
+      [id]
+    );
+    if (!bRes.rows.length) {
+      return res.status(404).json({ status: "error", error: "Log not found" });
+    }
+    const broadcast = bRes.rows[0];
+
+    const rRes = await pgPool.query(
+      `SELECT * FROM broadcast_recipients
+       WHERE broadcast_id = $1
+       ORDER BY id`,
+      [id]
+    );
+
+    const fRes = await pgPool.query(
+      `SELECT * FROM broadcast_followups
+       WHERE broadcast_id = $1
+       ORDER BY at`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      log: {
+        broadcast,
+        recipients: rRes.rows,
+        followups: fRes.rows
+      }
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/logs/:id:", err);
+    res.status(500).json({ status: "error", error: String(err) });
   }
-  res.json({
-    status: "ok",
-    log
-  });
 });
 
 // Export CSV
 // GET /kirimpesan/broadcast/logs/:id/csv
-app.get("/kirimpesan/broadcast/logs/:id/csv", (req, res) => {
+app.get("/kirimpesan/broadcast/logs/:id/csv", async (req, res) => {
   const id = req.params.id;
-  const log = broadcastLogs.find((l) => l.id === id);
-  if (!log) {
-    return res.status(404).send("Log not found");
-  }
-
-  const resultsMap = {};
-  (log.results || []).forEach((r) => {
-    if (!r.phone) return;
-    resultsMap[String(r.phone)] = r;
-  });
-
-  const followupMap = {};
-  (log.followups || []).forEach((f) => {
-    if (!f.phone) return;
-    followupMap[String(f.phone)] = f;
-  });
-
-  // cari var terbanyak supaya header konsisten
-  let maxVar = 0;
-  (log.rows || []).forEach((row) => {
-    Object.keys(row).forEach((k) => {
-      const m = /^var(\d+)$/.exec(k);
-      if (m) {
-        const n = parseInt(m[1], 10);
-        if (!isNaN(n) && n > maxVar) maxVar = n;
-      }
-    });
-  });
-
-  const headers = ["phone"];
-  for (let i = 1; i <= maxVar; i++) {
-    headers.push(`var${i}`);
-  }
-  headers.push(
-    "follow_media",
-    "template_ok",
-    "template_http_status",
-    "template_error",
-    "followup_status",
-    "followup_has_media",
-    "followup_media_link",
-    "followup_at"
-  );
-
-  const lines = [];
-  lines.push(headers.join(","));
-
-  (log.rows || []).forEach((row) => {
-    const phone = row.phone || row.to || "";
-    if (!phone) return;
-
-    const r = resultsMap[String(phone)] || {};
-    const f = followupMap[String(phone)] || {};
-
-    const cols = [];
-    cols.push(`"${phone}"`);
-
-    for (let i = 1; i <= maxVar; i++) {
-      const v = row[`var${i}`] != null ? String(row[`var${i}`]) : "";
-      cols.push(`"${v.replace(/"/g, '""')}"`);
+  try {
+    const bRes = await pgPool.query(
+      "SELECT * FROM broadcasts WHERE id = $1",
+      [id]
+    );
+    if (!bRes.rows.length) {
+      return res.status(404).send("Log not found");
     }
 
-    const followMedia = row.follow_media || "";
-    cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
+    const rRes = await pgPool.query(
+      `SELECT * FROM broadcast_recipients
+       WHERE broadcast_id = $1
+       ORDER BY id`,
+      [id]
+    );
+    const fRes = await pgPool.query(
+      `SELECT * FROM broadcast_followups
+       WHERE broadcast_id = $1`,
+      [id]
+    );
 
-    cols.push(r.ok ? "1" : "0");
-    cols.push(r.status != null ? String(r.status) : "");
-    const errStr =
-      typeof r.error === "string"
-        ? r.error
-        : r.error
-        ? JSON.stringify(r.error)
-        : "";
-    cols.push(`"${errStr.replace(/"/g, '""')}"`);
+    const recipients = rRes.rows;
+    const followups  = fRes.rows;
 
-    cols.push(f.status || "");
-    cols.push(f.has_media ? "1" : "0");
-    cols.push(`"${(f.media_link || "").replace(/"/g, '""')}"`);
-    cols.push(f.at || "");
+    const followupMap = {};
+    followups.forEach((f) => {
+      if (!f.phone) return;
+      followupMap[String(f.phone)] = f;
+    });
 
-    lines.push(cols.join(","));
-  });
+    // cari var terbanyak supaya header konsisten
+    let maxVar = 0;
+    recipients.forEach((row) => {
+      const vars = row.vars_json || {};
+      Object.keys(vars).forEach((k) => {
+        const m = /^var(\d+)$/.exec(k);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (!isNaN(n) && n > maxVar) maxVar = n;
+        }
+      });
+    });
 
-  const csv = lines.join("\n");
+    const headers = ["phone"];
+    for (let i = 1; i <= maxVar; i++) {
+      headers.push(`var${i}`);
+    }
+    headers.push(
+      "follow_media",
+      "template_ok",
+      "template_http_status",
+      "template_error",
+      "followup_status",
+      "followup_has_media",
+      "followup_media_link",
+      "followup_at"
+    );
 
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="broadcast-${id}.csv"`
-  );
-  res.send(csv);
+    const lines = [];
+    lines.push(headers.join(","));
+
+    recipients.forEach((row) => {
+      const phone = row.phone || "";
+      if (!phone) return;
+
+      const vars = row.vars_json || {};
+      const f    = followupMap[String(phone)] || {};
+
+      const cols = [];
+      cols.push(`"${phone}"`);
+
+      for (let i = 1; i <= maxVar; i++) {
+        const key = "var" + i;
+        const v   = vars[key] != null ? String(vars[key]) : "";
+        cols.push(`"${v.replace(/"/g, '""')}"`);
+      }
+
+      const followMedia = row.follow_media || "";
+      cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
+
+      cols.push(row.template_ok ? "1" : "0");
+      cols.push(row.template_http_status != null ? String(row.template_http_status) : "");
+
+      const errStr =
+        typeof row.template_error === "string"
+          ? row.template_error
+          : row.template_error
+          ? JSON.stringify(row.template_error)
+          : "";
+      cols.push(`"${errStr.replace(/"/g, '""')}"`);
+
+      cols.push(f.status || "");
+      cols.push(f.has_media ? "1" : "0");
+      cols.push(`"${((f.media_link || "") + "").replace(/"/g, '""')}"`);
+      cols.push(f.at ? f.at.toISOString() : "");
+
+      lines.push(cols.join(","));
+    });
+
+    const csv = lines.join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="broadcast-${id}.csv"`
+    );
+    res.send(csv);
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/logs/:id/csv:", err);
+    res.status(500).send("Internal error");
+  }
 });
 
 // ====== START SERVER ======
