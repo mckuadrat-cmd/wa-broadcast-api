@@ -29,6 +29,11 @@ const FOLLOWUP_DOCUMENT_URL = process.env.FOLLOWUP_DOCUMENT_URL || "";
 // PORT Railway otomatis pakai process.env.PORT
 const PORT = process.env.PORT || 3000;
 
+// Menyimpan konfigurasi follow-up terakhir dari frontend
+let lastFollowupConfig = null;
+// Menyimpan mapping nomor → row broadcast terakhir (untuk var & attachment per-orang)
+let lastBroadcastRowsByPhone = {};
+
 // ====== MIDDLEWARE ======
 app.use(cors());
 app.use(express.json());
@@ -331,13 +336,34 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
   try {
-    const { template_name, rows, phone_number_id, sender_phone } = req.body || {};
+    const { template_name, rows, phone_number_id, sender_phone, followup } = req.body || {};
 
     if (!template_name) {
       return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
     }
     if (!Array.isArray(rows) || !rows.length) {
       return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
+    }
+
+     // === FOLLOW-UP CONFIG DARI FRONTEND ===
+    if (followup && followup.text) {
+      lastFollowupConfig = followup;
+      lastBroadcastRowsByPhone = {};
+
+      // Simpan mapping nomor → row
+      rows.forEach((r) => {
+        const phone = r.phone || r.to;
+        if (phone) {
+          lastBroadcastRowsByPhone[String(phone)] = r;
+        }
+      });
+
+      console.log("Updated followup config:", lastFollowupConfig);
+    } else {
+      // followup kosong → webhook dimatikan
+      lastFollowupConfig = null;
+      lastBroadcastRowsByPhone = {};
+      console.log("Followup disabled for this broadcast.");
     }
 
     let effectivePhoneId = phone_number_id || null;
@@ -462,6 +488,24 @@ app.post("/kirimpesan/custom", async (req, res) => {
 //    POST /kirimpesan/webhook  → handle pesan masuk (quick reply "Bersedia")
 // =======================================================
 
+function applyFollowupTemplate(text, row) {
+  if (!text) return "";
+  if (!row) return text;
+
+  const varMap = {};
+
+  Object.keys(row).forEach((k) => {
+    const m = /^var(\d+)$/.exec(k);
+    if (m && row[k] != null) {
+      varMap[m[1]] = String(row[k]);
+    }
+  });
+
+  return text.replace(/\{\{(\d+)\}\}/g, (_, idx) => {
+    return Object.prototype.hasOwnProperty.call(varMap, idx) ? varMap[idx] : "";
+  });
+}
+
 // Verifikasi webhook (saat set callback URL di Facebook Developer)
 app.get("/kirimpesan/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -521,26 +565,46 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     if (upperTxt.includes("BERSEDIA")) {
       console.log("🔥 Trigger BERSEDIA dari", from);
 
-      const payload = {
-        to: from,
-        text: FOLLOWUP_MESSAGE_TEXT,
-      };
+      // Kalau follow-up tidak diset dari frontend → jangan kirim apa-apa
+      if (!lastFollowupConfig || !lastFollowupConfig.text) {
+        console.log("No followup config set, ignoring.");
+        return res.sendStatus(200);
+      }
 
-      if (FOLLOWUP_DOCUMENT_URL) {
-        payload.media = {
+      // Ambil row broadcast terakhir untuk nomor ini (kalau ada)
+      const row = lastBroadcastRowsByPhone[String(from)] || null;
+
+      // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ...
+      const text = applyFollowupTemplate(lastFollowupConfig.text, row);
+
+      // Attachment:
+      // 1) kalau row punya follow_media → pakai itu
+      // 2) kalau tidak, tapi followup.static_media ada → pakai itu
+      let media = null;
+      if (row && row.follow_media) {
+        media = {
           type: "document",
-          link: FOLLOWUP_DOCUMENT_URL,
+          link: row.follow_media
+        };
+      } else if (
+        lastFollowupConfig.static_media &&
+        lastFollowupConfig.static_media.type &&
+        lastFollowupConfig.static_media.link
+      ) {
+        media = {
+          type: lastFollowupConfig.static_media.type,
+          link: lastFollowupConfig.static_media.link
         };
       }
+
+      const payload = { to: from, text };
+      if (media) payload.media = media;
 
       try {
         const data = await sendCustomMessage(payload);
         console.log("Follow-up sent:", JSON.stringify(data, null, 2));
       } catch (err) {
-        console.error(
-          "Error sending follow-up:",
-          err.response?.data || err.message
-        );
+        console.error("Error sending follow-up:", err.response?.data || err.message);
       }
     }
 
