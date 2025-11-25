@@ -33,6 +33,9 @@ const PORT = process.env.PORT || 3000;
 let lastFollowupConfig = null;
 // Menyimpan mapping nomor → row broadcast terakhir (untuk var & attachment per-orang)
 let lastBroadcastRowsByPhone = {};
+// Menyimpan riwayat broadcast (in-memory)
+let broadcastLogs = [];   // [{ id, created_at, template_name, sender_phone, phone_number_id, followup_enabled, rows, results, followups }]
+let lastBroadcastId = null;
 
 // ====== MIDDLEWARE ======
 app.use(cors());
@@ -329,9 +332,13 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 //      sender_phone: "62851....",        // optional: display number dari dropdown
 //      phone_number_id: "1234567890",    // optional: kalau mau kirim ID langsung
 //      rows: [
-//        { phone: "62812...", var1: "Ridwan", var2: "1234", ... },
+//        { phone: "62812...", var1: "Ridwan", var2: "1234", follow_media: "https://..." },
 //        ...
-//      ]
+//      ],
+//      followup: {
+//        text: "Terima kasih, {{1}} ...",
+//        static_media: { type: "document", link: "https://..." }
+//      }
 //    }
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
@@ -345,19 +352,10 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
     }
 
-     // === FOLLOW-UP CONFIG DARI FRONTEND ===
+    // === FOLLOW-UP CONFIG DARI FRONTEND ===
     if (followup && followup.text) {
       lastFollowupConfig = followup;
       lastBroadcastRowsByPhone = {};
-
-      // Simpan mapping nomor → row
-      rows.forEach((r) => {
-        const phone = r.phone || r.to;
-        if (phone) {
-          lastBroadcastRowsByPhone[String(phone)] = r;
-        }
-      });
-
       console.log("Updated followup config:", lastFollowupConfig);
     } else {
       // followup kosong → webhook dimatikan
@@ -365,6 +363,11 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       lastBroadcastRowsByPhone = {};
       console.log("Followup disabled for this broadcast.");
     }
+
+    // Buat ID unik untuk broadcast ini
+    const broadcastId =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    lastBroadcastId = broadcastId;
 
     let effectivePhoneId = phone_number_id || null;
 
@@ -392,6 +395,13 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       const phone = row.phone || row.to;
       if (!phone) continue;
 
+      // Simpan mapping nomor → row + broadcastId (dipakai webhook)
+      lastBroadcastRowsByPhone[String(phone)] = {
+        row,
+        broadcastId
+      };
+
+      // vars boleh dikirim langsung (row.vars) atau diambil dari var1,var2,...
       let vars = row.vars;
       if (!Array.isArray(vars)) {
         const varKeys = Object.keys(row)
@@ -425,11 +435,32 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       }
     }
 
+    // Ringkasan
+    const total = results.length;
+    const ok = results.filter((r) => r.ok).length;
+    const failed = total - ok;
+
+    // Simpan log ke memory
+    broadcastLogs.push({
+      id: broadcastId,
+      created_at: new Date().toISOString(),
+      template_name,
+      sender_phone: sender_phone || null,
+      phone_number_id: effectivePhoneId || null,
+      followup_enabled: !!(followup && followup.text),
+      rows,
+      results,
+      followups: []    // akan diisi oleh webhook
+    });
+
     res.json({
       status: "ok",
+      broadcast_id: broadcastId,
       template_name,
-      count: results.length,
-      results,
+      count: total,
+      ok,
+      failed,
+      results
     });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast:", err);
@@ -564,19 +595,21 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     // Contoh: hanya respon kalau mengandung "BERSEDIA"
     if (upperTxt.includes("BERSEDIA")) {
       console.log("🔥 Trigger BERSEDIA dari", from);
-
+    
       // Kalau follow-up tidak diset dari frontend → jangan kirim apa-apa
       if (!lastFollowupConfig || !lastFollowupConfig.text) {
         console.log("No followup config set, ignoring.");
         return res.sendStatus(200);
       }
-
+    
       // Ambil row broadcast terakhir untuk nomor ini (kalau ada)
-      const row = lastBroadcastRowsByPhone[String(from)] || null;
-
+      const mapEntry = lastBroadcastRowsByPhone[String(from)] || null;
+      const row = mapEntry ? mapEntry.row : null;
+      const broadcastId = mapEntry ? mapEntry.broadcastId : null;
+    
       // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ...
       const text = applyFollowupTemplate(lastFollowupConfig.text, row);
-
+    
       // Attachment:
       // 1) kalau row punya follow_media → pakai itu
       // 2) kalau tidak, tapi followup.static_media ada → pakai itu
@@ -596,15 +629,48 @@ app.post("/kirimpesan/webhook", async (req, res) => {
           link: lastFollowupConfig.static_media.link
         };
       }
-
+    
       const payload = { to: from, text };
       if (media) payload.media = media;
-
+    
       try {
         const data = await sendCustomMessage(payload);
         console.log("Follow-up sent:", JSON.stringify(data, null, 2));
+    
+        // Catat ke log broadcast kalau ketemu
+        if (broadcastId) {
+          const log = broadcastLogs.find((l) => l.id === broadcastId);
+          if (log) {
+            log.followups = log.followups || [];
+            log.followups.push({
+              phone: from,
+              text,
+              has_media: !!media,
+              media_link: media ? media.link : null,
+              status: "ok",
+              wa_response: data,
+              at: new Date().toISOString()
+            });
+          }
+        }
       } catch (err) {
         console.error("Error sending follow-up:", err.response?.data || err.message);
+    
+        if (broadcastId) {
+          const log = broadcastLogs.find((l) => l.id === broadcastId);
+          if (log) {
+            log.followups = log.followups || [];
+            log.followups.push({
+              phone: from,
+              text,
+              has_media: !!media,
+              media_link: media ? media.link : null,
+              status: "error",
+              error: err.response?.data || err.message,
+              at: new Date().toISOString()
+            });
+          }
+        }
       }
     }
 
@@ -615,6 +681,149 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     console.error("Error /kirimpesan/webhook POST:", err);
     return res.sendStatus(500);
   }
+});
+
+// =======================================================
+// 9) LOG BROADCAST (IN-MEMORY)
+// =======================================================
+
+// Ringkasan semua log (urutan terbaru dulu)
+// GET /kirimpesan/broadcast/logs?limit=20
+app.get("/kirimpesan/broadcast/logs", (req, res) => {
+  const limit = parseInt(req.query.limit || "50", 10);
+
+  const sorted = [...broadcastLogs].sort(
+    (a, b) => new Date(b.created_at) - new Date(a.created_at)
+  );
+
+  const sliced = sorted.slice(0, limit).map((l) => ({
+    id: l.id,
+    created_at: l.created_at,
+    template_name: l.template_name,
+    sender_phone: l.sender_phone,
+    followup_enabled: l.followup_enabled,
+    total: l.results.length,
+    ok: l.results.filter((r) => r.ok).length,
+    failed: l.results.filter((r) => !r.ok).length,
+    followup_count: (l.followups || []).length
+  }));
+
+  res.json({
+    status: "ok",
+    count: sliced.length,
+    logs: sliced
+  });
+});
+
+// Detail satu log
+// GET /kirimpesan/broadcast/logs/:id
+app.get("/kirimpesan/broadcast/logs/:id", (req, res) => {
+  const id = req.params.id;
+  const log = broadcastLogs.find((l) => l.id === id);
+  if (!log) {
+    return res.status(404).json({ status: "error", error: "Log not found" });
+  }
+  res.json({
+    status: "ok",
+    log
+  });
+});
+
+// Export CSV
+// GET /kirimpesan/broadcast/logs/:id/csv
+app.get("/kirimpesan/broadcast/logs/:id/csv", (req, res) => {
+  const id = req.params.id;
+  const log = broadcastLogs.find((l) => l.id === id);
+  if (!log) {
+    return res.status(404).send("Log not found");
+  }
+
+  const resultsMap = {};
+  (log.results || []).forEach((r) => {
+    if (!r.phone) return;
+    resultsMap[String(r.phone)] = r;
+  });
+
+  const followupMap = {};
+  (log.followups || []).forEach((f) => {
+    if (!f.phone) return;
+    followupMap[String(f.phone)] = f;
+  });
+
+  // cari var terbanyak supaya header konsisten
+  let maxVar = 0;
+  (log.rows || []).forEach((row) => {
+    Object.keys(row).forEach((k) => {
+      const m = /^var(\d+)$/.exec(k);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (!isNaN(n) && n > maxVar) maxVar = n;
+      }
+    });
+  });
+
+  const headers = ["phone"];
+  for (let i = 1; i <= maxVar; i++) {
+    headers.push(`var${i}`);
+  }
+  headers.push(
+    "follow_media",
+    "template_ok",
+    "template_http_status",
+    "template_error",
+    "followup_status",
+    "followup_has_media",
+    "followup_media_link",
+    "followup_at"
+  );
+
+  const lines = [];
+  lines.push(headers.join(","));
+
+  (log.rows || []).forEach((row) => {
+    const phone = row.phone || row.to || "";
+    if (!phone) return;
+
+    const r = resultsMap[String(phone)] || {};
+    const f = followupMap[String(phone)] || {};
+
+    const cols = [];
+    cols.push(`"${phone}"`);
+
+    for (let i = 1; i <= maxVar; i++) {
+      const v = row[`var${i}`] != null ? String(row[`var${i}`]) : "";
+      cols.push(`"${v.replace(/"/g, '""')}"`);
+    }
+
+    const followMedia = row.follow_media || "";
+    cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
+
+    cols.push(r.ok ? "1" : "0");
+    cols.push(r.status != null ? String(r.status) : "");
+    const errStr =
+      typeof r.error === "string"
+        ? r.error
+        : r.error
+        ? JSON.stringify(r.error)
+        : "";
+    cols.push(`"${errStr.replace(/"/g, '""')}"`);
+
+    cols.push(f.status || "");
+    cols.push(f.has_media ? "1" : "0");
+    cols.push(`"${(f.media_link || "").replace(/"/g, '""')}"`);
+    cols.push(f.at || "");
+
+    lines.push(cols.join(","));
+  });
+
+  const csv = lines.join("\n");
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="broadcast-${id}.csv"`
+  );
+  res.send(csv);
 });
 
 // ====== START SERVER ======
