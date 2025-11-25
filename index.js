@@ -8,6 +8,13 @@ const axios = require("axios");
 
 const app = express();
 
+const { Pool } = require("pg");
+
+const pgPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // biasanya perlu di Railway
+});
+
 // ====== CONFIG DARI ENV ======
 const WABA_ID    = process.env.WABA_ID;          // ID WhatsApp Business Account
 const WA_TOKEN   = process.env.WA_TOKEN;         // Permanent token
