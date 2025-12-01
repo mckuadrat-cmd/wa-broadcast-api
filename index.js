@@ -303,6 +303,32 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
       baseMediaPayload.caption = text;
     }
 
+    // === khusus document: set filename supaya di WA muncul nama & format ===
+    if (mType === "document") {
+      let filename = media.filename; // boleh dikirim dari frontend
+
+      // Kalau frontend tidak kirim filename, coba tebak dari URL
+      if (!filename) {
+        try {
+          const urlObj   = new URL(media.link);
+          const pathname = urlObj.pathname || "";
+          const lastSeg  = pathname.split("/").filter(Boolean).pop() || "";
+
+          if (lastSeg && lastSeg.includes(".")) {
+            // contoh: /folder/Hasil_Asesmen_Ananda_Ani.pdf
+            filename = lastSeg;
+          } else {
+            // fallback default
+            filename = "document.pdf";
+          }
+        } catch (e) {
+          filename = "document.pdf";
+        }
+      }
+
+      baseMediaPayload.filename = filename;
+    }
+
     body = {
       messaging_product: "whatsapp",
       to,
