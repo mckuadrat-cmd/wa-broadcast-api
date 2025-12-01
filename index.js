@@ -437,7 +437,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 
       // Ambil vars dari row (row.vars atau var1,var2,...)
       let vars = row.vars;
-      const varsMap = {}; // { var1: "...", var2: "..." }
+      const varsMap = {}; // disimpan lengkap untuk follow-up {{1}}, {{2}}, dll
 
       if (!Array.isArray(vars)) {
         const varKeys = Object.keys(row)
@@ -448,16 +448,22 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
             return na - nb;
           });
 
+        // simpan SEMUA var ke varsMap (dipakai follow-up)
         vars = varKeys.map((k) => {
           varsMap[k] = row[k];
           return row[k];
         });
       } else {
-        // kalau sudah ada row.vars (array), kita simpan ke varsMap sebagai var1, var2, ...
         vars.forEach((v, idx) => {
           varsMap["var" + (idx + 1)] = v;
         });
       }
+
+      // ⚠️ PENTING:
+      // Template WA yang sekarang cuma punya {{1}},
+      // jadi ke Meta kita kirim HANYA param pertama.
+      const varsForTemplate =
+        Array.isArray(vars) && vars.length ? [vars[0]] : [];
 
       // follow_media per-orang (kolom terakhir CSV)
       const followMedia = row.follow_media || null;
@@ -467,7 +473,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
-          vars,
+          vars: varsForTemplate,   // ⬅️ pakai yg sudah dipotong jadi 1
           phone_number_id: effectivePhoneId,
         });
 
