@@ -723,16 +723,20 @@ app.post("/kirimpesan/webhook", async (req, res) => {
         type: "document",
         link: row.follow_media
       };
-    } else if (
-      lastFollowupConfig.static_media &&
-      lastFollowupConfig.static_media.type &&
-      lastFollowupConfig.static_media.link
-    ) {
-      media = {
-        type: lastFollowupConfig.static_media.type,
-        link: lastFollowupConfig.static_media.link
-      };
-    }
+      } else if (
+        lastFollowupConfig.static_media &&
+        lastFollowupConfig.static_media.type &&
+        lastFollowupConfig.static_media.link
+      ) {
+        const sm = lastFollowupConfig.static_media;
+        media = {
+          type: sm.type,
+          link: sm.link
+        };
+        if (sm.filename) {
+          media.filename = sm.filename;   // teruskan ke sendCustomMessage
+        }
+      }
 
     const payload = { to: from, text };
     if (media) payload.media = media;
