@@ -362,7 +362,14 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
   try {
-    const { template_name, rows, phone_number_id, sender_phone, followup } = req.body || {};
+    const {
+      template_name,
+      rows,
+      phone_number_id,
+      sender_phone,
+      followup,
+      schedule_at
+    } = req.body || {};
 
     if (!template_name) {
       return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
@@ -407,6 +414,14 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         console.warn("Gagal resolve sender_phone → phone_number_id:", e.message);
       }
     }
+
+    let scheduleAt = null;
+        if (schedule_at) {
+          const tmp = new Date(schedule_at);
+          if (!isNaN(tmp)) {
+            scheduleAt = tmp;
+          }
+        }
 
     // --- 2. Simpan broadcast ke Postgres ---
     await pgPool.query(
