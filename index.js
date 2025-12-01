@@ -830,6 +830,110 @@ app.post("/kirimpesan/webhook", async (req, res) => {
   }
 });
 
+// =======================================================
+//  RUN SCHEDULED BROADCASTS
+//  GET /kirimpesan/broadcast/run-scheduled
+//  Dipanggil oleh Railway Cron setiap 1 menit
+// =======================================================
+app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
+  try {
+    console.log("⏰ Checking scheduled broadcasts...");
+
+    const due = await pgPool.query(
+      `SELECT *
+       FROM broadcasts
+       WHERE status = 'scheduled'
+         AND scheduled_at IS NOT NULL
+         AND scheduled_at <= NOW()
+       ORDER BY scheduled_at ASC
+       LIMIT 3`
+    );
+
+    if (!due.rows.length) {
+      return res.json({ status: "ok", message: "No scheduled broadcasts due." });
+    }
+
+    const results = [];
+
+    for (const b of due.rows) {
+      // Tandai sebagai running
+      await pgPool.query(
+        `UPDATE broadcasts SET status='running' WHERE id=$1`,
+        [b.id]
+      );
+
+      // Ambil semua penerima
+      const r = await pgPool.query(
+        `SELECT * FROM broadcast_recipients
+         WHERE broadcast_id=$1
+         ORDER BY id`,
+        [b.id]
+      );
+
+      for (const row of r.rows) {
+        try {
+          // Convert vars_json → array vars
+          let vars = [];
+          const varMap = row.vars_json || {};
+          const keys = Object.keys(varMap).sort((a, b) => {
+            const na = parseInt(a.replace("var",""), 10);
+            const nb = parseInt(b.replace("var",""), 10);
+            return na - nb;
+          });
+          keys.forEach(k => vars.push(varMap[k]));
+
+          const send = await sendWaTemplate({
+            phone: row.phone,
+            templateName: b.template_name,
+            vars,
+            phone_number_id: b.phone_number_id
+          });
+
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+             SET template_ok=true,
+                 template_http_status=$2,
+                 template_error=null
+             WHERE id=$1`,
+            [row.id, send.status || 200]
+          );
+        } catch (err) {
+          const errorPayload = err.response?.data || err.message;
+
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+             SET template_ok=false,
+                 template_http_status=$2,
+                 template_error=$3
+             WHERE id=$1`,
+            [
+              row.id,
+              err.response?.status || 500,
+              typeof errorPayload === "string"
+                ? { message: errorPayload }
+                : errorPayload
+            ]
+          );
+        }
+      }
+
+      await pgPool.query(
+        `UPDATE broadcasts SET status='completed' WHERE id=$1`,
+        [b.id]
+      );
+
+      results.push({ broadcast_id: b.id, recipients: r.rows.length });
+    }
+
+    res.json({
+      status: "ok",
+      ran: results
+    });
+  } catch (err) {
+    console.error("Error run-scheduled:", err);
+    res.status(500).json({ status: "error", error: String(err) });
+  }
+});
 
 // =======================================================
 // 9) LOG BROADCAST (POSTGRES)
