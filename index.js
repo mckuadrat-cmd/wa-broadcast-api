@@ -602,17 +602,18 @@ app.post("/kirimpesan/webhook", async (req, res) => {
   console.log("📩 Incoming webhook:", JSON.stringify(req.body, null, 2));
 
   try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
+    const entry   = req.body.entry?.[0];
+    const change  = entry?.changes?.[0];
+    const value   = change?.value;
     const messages = value?.messages;
 
+    // Kalau bukan event message (mungkin hanya statuses) → langsung OK
     if (!messages || !messages.length) {
       return res.sendStatus(200);
     }
 
-    const msg = messages[0];
-    const from = msg.from; // nomor pengirim
+    const msg  = messages[0];
+    const from = msg.from; // nomor pengirim (user)
 
     let triggerText = "";
 
@@ -638,105 +639,146 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
     const upperTxt = triggerText.toUpperCase();
 
-    // Contoh: hanya respon kalau mengandung "BERSEDIA"
-    if (upperTxt.includes("BERSEDIA")) {
-      console.log("🔥 Trigger BERSEDIA dari", from);
-    
-      // Kalau follow-up tidak diset dari frontend → jangan kirim apa-apa
-      if (!lastFollowupConfig || !lastFollowupConfig.text) {
-        console.log("No followup config set, ignoring.");
-        return res.sendStatus(200);
-      }
-    
-      // Ambil row broadcast terakhir untuk nomor ini (kalau ada)
-      const mapEntry   = lastBroadcastRowsByPhone[String(from)] || null;
-      const row        = mapEntry ? mapEntry.row : null;
-      const broadcastId = mapEntry ? mapEntry.broadcastId : null;
-    
-      // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ...
-      const text = applyFollowupTemplate(lastFollowupConfig.text, row);
-    
-      // Attachment:
-      // 1) kalau row punya follow_media → pakai itu
-      // 2) kalau tidak, tapi followup.static_media ada → pakai itu
-      let media = null;
-      if (row && row.follow_media) {
-        media = {
-          type: "document",
-          link: row.follow_media
-        };
-      } else if (
-        lastFollowupConfig.static_media &&
-        lastFollowupConfig.static_media.type &&
-        lastFollowupConfig.static_media.link
-      ) {
-        media = {
-          type: lastFollowupConfig.static_media.type,
-          link: lastFollowupConfig.static_media.link
-        };
-      }
-    
-      const payload = { to: from, text };
-      if (media) payload.media = media;
-    
-      try {
-        const data = await sendCustomMessage(payload);
-        console.log("Follow-up sent:", JSON.stringify(data, null, 2));
-
-        // Catat ke Postgres
-        if (broadcastId) {
-          await pgPool.query(
-            `INSERT INTO broadcast_followups (
-               broadcast_id, phone, text, has_media, media_link,
-               status, error, at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
-              broadcastId,
-              from,
-              text,
-              !!media,
-              media ? media.link : null,
-              "ok",
-              null,
-              new Date().toISOString()
-            ]
-          );
-        }
-      } catch (err) {
-        console.error("Error sending follow-up:", err.response?.data || err.message);
-
-        if (broadcastId) {
-          const errorPayload = err.response?.data || err.message;
-          await pgPool.query(
-            `INSERT INTO broadcast_followups (
-               broadcast_id, phone, text, has_media, media_link,
-               status, error, at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
-              broadcastId,
-              from,
-              text,
-              !!media,
-              media ? media.link : null,
-              "error",
-              typeof errorPayload === "string"
-                ? { message: errorPayload }
-                : errorPayload,
-              new Date().toISOString()
-            ]
-          );
-        }
-      }
+    // === Hanya respon kalau mengandung "BERSEDIA" (bisa kamu ganti ke payload/id khusus) ===
+    if (!upperTxt.includes("BERSEDIA")) {
+      return res.sendStatus(200);
     }
 
-    // bisa tambah else-if utk trigger lain di sini
+    console.log("🔥 Trigger BERSEDIA dari", from);
+
+    // Kalau follow-up tidak diset dari frontend → jangan kirim apa-apa
+    if (!lastFollowupConfig || !lastFollowupConfig.text) {
+      console.log("No followup config set, ignoring.");
+      return res.sendStatus(200);
+    }
+
+    // Ambil row broadcast terakhir untuk nomor ini (kalau ada) dari map in-memory
+    const mapEntry    = lastBroadcastRowsByPhone[String(from)] || null;
+    const row         = mapEntry ? mapEntry.row : null;
+    const broadcastId = mapEntry ? mapEntry.broadcastId : null;
+
+    // Kalau tidak ada broadcastId atau row (misal server sempat restart),
+    // JANGAN kirim follow-up, supaya tidak nyasar & tidak loop.
+    if (!broadcastId || !row) {
+      console.log("No mapping row/broadcastId for", from, "- skip followup.");
+      return res.sendStatus(200);
+    }
+
+    // ==== Anti-duplicate: cek dulu apakah sudah pernah kirim follow-up OK
+    try {
+      const fCheck = await pgPool.query(
+        `SELECT 1
+         FROM broadcast_followups
+         WHERE broadcast_id = $1
+           AND phone = $2
+           AND status = 'ok'
+         LIMIT 1`,
+        [broadcastId, from]
+      );
+
+      if (fCheck.rows.length) {
+        console.log("Follow-up already sent for", from, "on broadcast", broadcastId, "- skip.");
+        return res.sendStatus(200);
+      }
+    } catch (err) {
+      console.error("Error check existing followup:", err);
+      // Tapi tetap lanjut kirim supaya user tetap dapat respon
+    }
+
+    // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ...
+    const text = applyFollowupTemplate(lastFollowupConfig.text, row);
+
+    // Attachment:
+    // 1) kalau row punya follow_media → pakai itu (PDF per orang)
+    // 2) kalau tidak, tapi followup.static_media ada → pakai itu (PDF statis)
+    let media = null;
+    if (row && row.follow_media) {
+      media = {
+        type: "document",
+        link: row.follow_media
+      };
+    } else if (
+      lastFollowupConfig.static_media &&
+      lastFollowupConfig.static_media.type &&
+      lastFollowupConfig.static_media.link
+    ) {
+      media = {
+        type: lastFollowupConfig.static_media.type,
+        link: lastFollowupConfig.static_media.link
+      };
+    }
+
+    const payload = { to: from, text };
+    if (media) payload.media = media;
+
+    console.log("🚀 Sending followup to", from, "with media:", media);
+
+    // Kirim pesan follow-up + log ke DB
+    try {
+      const data = await sendCustomMessage(payload);
+      console.log("Follow-up sent:", JSON.stringify(data, null, 2));
+
+      try {
+        await pgPool.query(
+          `INSERT INTO broadcast_followups (
+             broadcast_id, phone, text, has_media, media_link,
+             status, error, at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
+            broadcastId,
+            from,
+            text,
+            !!media,
+            media ? media.link : null,
+            "ok",
+            null,
+            new Date().toISOString()
+          ]
+        );
+      } catch (dbErr) {
+        console.error("Error inserting followup log (ok):", dbErr);
+        // Jangan lempar error ke luar → supaya tetap balas 200 ke Meta (hindari retry loop)
+      }
+
+      // Setelah sukses, hapus mapping in-memory supaya tidak kirim ulang untuk nomor yang sama
+      delete lastBroadcastRowsByPhone[String(from)];
+    } catch (err) {
+      console.error("Error sending follow-up:", err.response?.data || err.message);
+
+      const errorPayload = err.response?.data || err.message;
+
+      try {
+        await pgPool.query(
+          `INSERT INTO broadcast_followups (
+             broadcast_id, phone, text, has_media, media_link,
+             status, error, at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
+            broadcastId,
+            from,
+            text,
+            !!media,
+            media ? media.link : null,
+            "error",
+            typeof errorPayload === "string"
+              ? { message: errorPayload }
+              : errorPayload,
+            new Date().toISOString()
+          ]
+        );
+      } catch (dbErr) {
+        console.error("Error inserting followup log (error):", dbErr);
+      }
+    }
 
     return res.sendStatus(200);
   } catch (err) {
     console.error("Error /kirimpesan/webhook POST:", err);
-    return res.sendStatus(500);
+    // Tetap balas 200 kalau bisa; tapi di sini sudah fatal banget
+    return res.sendStatus(200);
   }
 });
+
 
 // =======================================================
 // 9) LOG BROADCAST (POSTGRES)
