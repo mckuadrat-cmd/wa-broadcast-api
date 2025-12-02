@@ -379,14 +379,29 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
     }
 
     // --- cek apakah ini broadcast terjadwal? ---
+    const JAKARTA_OFFSET_MIN = 7 * 60; // +07:00
+
+    function parseJakartaLocalToUtc(str) {
+      // str contoh: "2025-12-02T13:20" dari <input type="datetime-local">
+      const dLocal = new Date(str);
+      if (isNaN(dLocal.getTime())) return null;
+
+      const localMs = dLocal.getTime();
+      // konversi "jam Jakarta" → UTC
+      const utcMs = localMs - JAKARTA_OFFSET_MIN * 60 * 1000;
+      return new Date(utcMs);
+    }
+
     let scheduledDate = null;
-    let isScheduled = false;
+    let isScheduled   = false;
+
     if (scheduled_at) {
-      const d = new Date(scheduled_at);
-      if (!isNaN(d.getTime())) {
-        scheduledDate = d;
-        // kalau jadwal di masa depan → anggap scheduled
-        if (d.getTime() > Date.now() + 15 * 1000) {
+      const dUtc = parseJakartaLocalToUtc(scheduled_at);
+      if (dUtc) {
+        scheduledDate = dUtc;
+
+        // kalau jadwal lebih dari 15 detik ke depan → dianggap scheduled
+        if (dUtc.getTime() > Date.now() + 15 * 1000) {
           isScheduled = true;
         }
       }
