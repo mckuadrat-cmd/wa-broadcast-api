@@ -535,6 +535,12 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         });
       }
 
+      // ⚠️ PENTING:
+      // Template WA yang sekarang cuma punya {{1}},
+      // jadi ke Meta kita kirim HANYA param pertama.
+      const varsForTemplate =
+        Array.isArray(vars) && vars.length ? [vars[0]] : [];
+
       const followMedia = row.follow_media || null;
 
       try {
