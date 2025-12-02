@@ -393,7 +393,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
     }
 
     let scheduledDate = null;
-    let isScheduled   = false;
+    let isScheduled = false;
 
     if (scheduled_at) {
       const dUtc = parseJakartaLocalToUtc(scheduled_at);
@@ -451,8 +451,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
        ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)`,
       [
         broadcastId,
-        scheduledDate,                       // bisa null
-        isScheduled ? "scheduled" : "sent",  // status awal
+        scheduledDate,                      // bisa null
+        isScheduled ? "scheduled" : "sent", // status awal
         template_name,
         sender_phone || null,
         effectivePhoneId || null,
@@ -480,7 +480,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4, NULL, NULL, NULL, NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, NULL, NULL, NULL, NOW())`,
           [
             broadcastId,                                   // $1
             phone,                                         // $2
@@ -512,7 +512,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         broadcastId
       };
 
-      // Ambil vars dari row
+      // Ambil semua vars dari row (untuk disimpan di DB)
       let vars = row.vars;
       const varsMap = {};
 
@@ -536,8 +536,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       }
 
       // ⚠️ PENTING:
-      // Template WA yang sekarang cuma punya {{1}},
-      // jadi ke Meta kita kirim HANYA param pertama.
+      // Template WA sekarang cuma punya {{1}},
+      // jadi ke Meta kita kirim HANYA parameter pertama.
       const varsForTemplate =
         Array.isArray(vars) && vars.length ? [vars[0]] : [];
 
@@ -547,8 +547,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
-          vars,
-          phone_number_id: effectivePhoneId,
+          vars: varsForTemplate,          // <= DI SINI pakai varsForTemplate
+          phone_number_id: effectivePhoneId
         });
 
         results.push(r);
@@ -557,7 +557,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW())`,
           [
             broadcastId,                                      // $1
             phone,                                            // $2
@@ -578,14 +578,14 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           ok: false,
           status: err.response?.status || 500,
           messageId: null,
-          error: errorPayload,
+          error: errorPayload
         });
 
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW())`,
           [
             broadcastId,                                      // $1
             phone,                                            // $2
@@ -618,7 +618,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
     console.error("Error /kirimpesan/broadcast:", err);
     res.status(500).json({
       status: "error",
-      error: String(err),
+      error: String(err)
     });
   }
 });
