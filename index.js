@@ -465,7 +465,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,NULL,NULL,NULL,NOW())`,
+           ) VALUES ($1,$2,$3,$4,NULL,NULL,NULL,NOW())`,
           [
             broadcastId,
             phone,
@@ -536,7 +536,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
             broadcastId,
             phone,
@@ -564,7 +564,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
             broadcastId,
             phone,
