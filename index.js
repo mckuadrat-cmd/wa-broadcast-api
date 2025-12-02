@@ -661,6 +661,29 @@ function applyFollowupTemplate(text, row) {
     }
   });
 
+  function buildFilenameFromTemplate(tpl, row) {
+  if (!tpl) return null;
+
+  // pakai applyFollowupTemplate supaya {{1}}, {{2}}, ... keisi dari var1, var2,...
+  let name = applyFollowupTemplate(tpl, row);
+
+  if (!name || !name.trim()) {
+    name = "document.pdf";
+  }
+
+  name = name.trim();
+
+  // pastikan ada ekstensi .pdf di belakang
+  if (!name.toLowerCase().endsWith(".pdf")) {
+    name = name + ".pdf";
+  }
+
+  // opsional: rapikan spasi jadi underscore
+  // name = name.replace(/\s+/g, "_");
+
+  return name;
+}
+
   return text.replace(/\{\{(\d+)\}\}/g, (_, idx) => {
     return Object.prototype.hasOwnProperty.call(varMap, idx) ? varMap[idx] : "";
   });
@@ -763,17 +786,24 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       const text = applyFollowupTemplate(lastFollowupConfig.text, linkedRow);
 
       // Attachment:
-      // 1) kalau row punya follow_media → pakai itu
+      // 1) kalau row punya follow_media → pakai itu (document)
       // 2) kalau tidak, tapi followup.static_media ada → pakai itu
       let media = null;
+  
+      // siapkan filename template (boleh berisi {{1}}, {{2}}, dll)
+      const filenameTpl = lastFollowupConfig.static_media?.filename || null;
+      const finalFilename = filenameTpl
+        ? buildFilenameFromTemplate(filenameTpl, linkedRow)
+        : null;
+  
       if (linkedRow && linkedRow.follow_media) {
         media = {
           type: "document",
           link: linkedRow.follow_media,
-          ...(lastFollowupConfig.static_media?.filename
-            ? { filename: lastFollowupConfig.static_media.filename }
-            : {})
         };
+        if (finalFilename) {
+          media.filename = finalFilename;
+        }
       } else if (
         lastFollowupConfig.static_media &&
         lastFollowupConfig.static_media.type &&
@@ -782,10 +812,10 @@ app.post("/kirimpesan/webhook", async (req, res) => {
         media = {
           type: lastFollowupConfig.static_media.type,
           link: lastFollowupConfig.static_media.link,
-          ...(lastFollowupConfig.static_media.filename
-            ? { filename: lastFollowupConfig.static_media.filename }
-            : {})
         };
+        if (finalFilename) {
+          media.filename = finalFilename;
+        }
       }
 
       const payload = { to: from, text };
