@@ -480,12 +480,12 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES (gen_random_uuid(), $1,$2,$3,$4, NULL, NULL, NULL, NOW())`,
           [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            followMedia
+            broadcastId,                                   // $1
+            phone,                                         // $2
+            Object.keys(varsMap).length ? varsMap : null, // $3
+            followMedia                                    // $4
           ]
         );
       }
@@ -620,15 +620,6 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 // =======================================================
 // 7) POST /kirimpesan/custom
 //    Kirim pesan bebas (text + optional media)
-//    Body JSON:
-//    {
-//      "to": "62812....",
-//      "text": "Terima kasih sudah bersedia...",
-//      "media": {
-//        "type": "document" | "image" | "audio" | "video",
-//        "link": "https://...."
-//      }
-//    }
 // =======================================================
 app.post("/kirimpesan/custom", async (req, res) => {
   try {
@@ -678,7 +669,13 @@ function applyFollowupTemplate(text, row) {
     }
   });
 
-  function buildFilenameFromTemplate(tpl, row) {
+  return text.replace(/\{\{(\d+)\}\}/g, (_, idx) => {
+    return Object.prototype.hasOwnProperty.call(varMap, idx) ? varMap[idx] : "";
+  });
+}
+
+// Bangun nama file dari template, boleh pakai {{1}}, {{2}}, dll
+function buildFilenameFromTemplate(tpl, row) {
   if (!tpl) return null;
 
   // pakai applyFollowupTemplate supaya {{1}}, {{2}}, ... keisi dari var1, var2,...
@@ -699,11 +696,6 @@ function applyFollowupTemplate(text, row) {
   // name = name.replace(/\s+/g, "_");
 
   return name;
-}
-
-  return text.replace(/\{\{(\d+)\}\}/g, (_, idx) => {
-    return Object.prototype.hasOwnProperty.call(varMap, idx) ? varMap[idx] : "";
-  });
 }
 
 // Verifikasi webhook (saat set callback URL di Facebook Developer)
@@ -756,8 +748,8 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     console.log("Webhook message type:", msg.type, "from:", from, "triggerText:", triggerText);
 
     // Mapping ke broadcast terakhir (kalau ada)
-    const mapEntry        = lastBroadcastRowsByPhone[String(from)] || null;
-    const linkedRow       = mapEntry ? mapEntry.row : null;
+    const mapEntry          = lastBroadcastRowsByPhone[String(from)] || null;
+    const linkedRow         = mapEntry ? mapEntry.row : null;
     const linkedBroadcastId = mapEntry ? mapEntry.broadcastId : null;
 
     // ========== SIMPAN KE TABEL inbox_messages ==========
@@ -806,13 +798,13 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       // 1) kalau row punya follow_media → pakai itu (document)
       // 2) kalau tidak, tapi followup.static_media ada → pakai itu
       let media = null;
-  
+
       // siapkan filename template (boleh berisi {{1}}, {{2}}, dll)
-      const filenameTpl = lastFollowupConfig.static_media?.filename || null;
+      const filenameTpl   = lastFollowupConfig.static_media?.filename || null;
       const finalFilename = filenameTpl
         ? buildFilenameFromTemplate(filenameTpl, linkedRow)
         : null;
-  
+
       if (linkedRow && linkedRow.follow_media) {
         media = {
           type: "document",
@@ -844,12 +836,12 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
         // Catat ke Postgres
         if (linkedBroadcastId) {
-        await pgPool.query(
-          `INSERT INTO broadcast_followups (
-             id, broadcast_id, phone, text, has_media, media_link,
-             status, error, at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
-          [
+          await pgPool.query(
+            `INSERT INTO broadcast_followups (
+               id, broadcast_id, phone, text, has_media, media_link,
+               status, error, at
+             ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
               linkedBroadcastId,
               from,
               text,
