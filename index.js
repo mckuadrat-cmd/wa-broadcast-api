@@ -551,15 +551,15 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            followMedia,
-            true,
-            r.status || null,
-            null
+            broadcastId,                                      // $1
+            phone,                                            // $2
+            Object.keys(varsMap).length ? varsMap : null,     // $3
+            followMedia,                                      // $4
+            true,                                             // $5
+            r.status || null,                                 // $6
+            null                                              // $7
           ]
         );
       } catch (err) {
@@ -579,15 +579,17 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            followMedia,
-            false,
-            err.response?.status || null,
-            typeof errorPayload === "string" ? { message: errorPayload } : errorPayload
+            broadcastId,                                      // $1
+            phone,                                            // $2
+            Object.keys(varsMap).length ? varsMap : null,     // $3
+            followMedia,                                      // $4
+            false,                                            // $5
+            err.response?.status || null,                     // $6
+            typeof errorPayload === "string"
+              ? { message: errorPayload }
+              : errorPayload                                  // $7
           ]
         );
       }
