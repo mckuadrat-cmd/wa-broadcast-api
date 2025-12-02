@@ -844,12 +844,12 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
         // Catat ke Postgres
         if (linkedBroadcastId) {
-          await pgPool.query(
-            `INSERT INTO broadcast_followups (
-               broadcast_id, phone, text, has_media, media_link,
-               status, error, at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
+        await pgPool.query(
+          `INSERT INTO broadcast_followups (
+             id, broadcast_id, phone, text, has_media, media_link,
+             status, error, at
+           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
               linkedBroadcastId,
               from,
               text,
@@ -868,9 +868,9 @@ app.post("/kirimpesan/webhook", async (req, res) => {
           const errorPayload = err.response?.data || err.message;
           await pgPool.query(
             `INSERT INTO broadcast_followups (
-               broadcast_id, phone, text, has_media, media_link,
+               id, broadcast_id, phone, text, has_media, media_link,
                status, error, at
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+             ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
             [
               linkedBroadcastId,
               from,
