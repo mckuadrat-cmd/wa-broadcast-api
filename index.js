@@ -358,7 +358,7 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 }
 
 // =======================================================
-// 6) POST /kirimpesan/broadcast  (PAKAI POSTGRES + SCHEDULE)
+// 6) POST /kirimpesan/broadcast  (VERSI PAKAI POSTGRES)
 // =======================================================
 app.post("/kirimpesan/broadcast", async (req, res) => {
   try {
@@ -368,7 +368,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       phone_number_id,
       sender_phone,
       followup,
-      scheduled_at
+      schedule_at
     } = req.body || {};
 
     if (!template_name) {
@@ -378,26 +378,13 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
     }
 
-    // --- cek apakah ini broadcast terjadwal? ---
-    let scheduledDate = null;
-    let isScheduled = false;
-    if (scheduled_at) {
-      const d = new Date(scheduled_at);
-      if (!isNaN(d.getTime())) {
-        scheduledDate = d;
-        // kalau jadwal di masa depan → anggap scheduled
-        if (d.getTime() > Date.now() + 15 * 1000) {
-          isScheduled = true;
-        }
-      }
-    }
-
-    // === FOLLOW-UP CONFIG DARI FRONTEND (masih in-memory untuk webhook) ===
+    // === FOLLOW-UP CONFIG DARI FRONTEND ===
     if (followup && followup.text) {
       lastFollowupConfig = followup;
       lastBroadcastRowsByPhone = {};
       console.log("Updated followup config:", lastFollowupConfig);
     } else {
+      // followup kosong → webhook dimatikan
       lastFollowupConfig = null;
       lastBroadcastRowsByPhone = {};
       console.log("Followup disabled for this broadcast.");
@@ -428,16 +415,21 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       }
     }
 
-    // --- 1. Simpan broadcast ke Postgres ---
+    let scheduleAt = null;
+        if (schedule_at) {
+          const tmp = new Date(schedule_at);
+          if (!isNaN(tmp)) {
+            scheduleAt = tmp;
+          }
+        }
+
+    // --- 2. Simpan broadcast ke Postgres ---
     await pgPool.query(
       `INSERT INTO broadcasts (
-         id, created_at, scheduled_at, status,
-         template_name, sender_phone, phone_number_id, followup_enabled
-       ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)`,
+        id, created_at, template_name, sender_phone, phone_number_id, followup_enabled
+      ) VALUES ($1, NOW(), $2, $3, $4, $5)`,
       [
         broadcastId,
-        scheduledDate,                       // bisa null
-        isScheduled ? "scheduled" : "sent",  // status awal
         template_name,
         sender_phone || null,
         effectivePhoneId || null,
@@ -445,61 +437,22 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       ]
     );
 
-    // --- 2. Kalau SCHEDULED → cuma simpan penerima, BELUM kirim WA ---
-    if (isScheduled) {
-      for (const row of rows) {
-        const phone = row.phone || row.to;
-        if (!phone) continue;
-
-        // siapkan vars_json
-        const varsMap = {};
-        Object.keys(row)
-          .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
-          .forEach((k) => {
-            varsMap[k] = row[k];
-          });
-
-        const followMedia = row.follow_media || null;
-
-        await pgPool.query(
-          `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
-             template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,NULL,NULL,NULL,NOW())`,
-          [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            followMedia
-          ]
-        );
-      }
-
-      return res.json({
-        status: "scheduled",
-        broadcast_id: broadcastId,
-        template_name,
-        scheduled_at: scheduledDate.toISOString(),
-        count: rows.length
-      });
-    }
-
-    // --- 3. Kalau TIDAK ada schedule → kirim langsung seperti biasa ---
     const results = [];
 
+    // --- 3. Loop tiap row penerima ---
     for (const row of rows) {
       const phone = row.phone || row.to;
       if (!phone) continue;
 
-      // Simpan mapping nomor → row + broadcastId (dipakai webhook)
+      // Simpan mapping nomor → row + broadcastId (dipakai webhook untuk isi {{1}},{{2}},...)
       lastBroadcastRowsByPhone[String(phone)] = {
         row,
         broadcastId
       };
 
-      // Ambil vars dari row
+      // Ambil vars dari row (row.vars atau var1,var2,...)
       let vars = row.vars;
-      const varsMap = {};
+      const varsMap = {}; // disimpan lengkap untuk follow-up {{1}}, {{2}}, dll
 
       if (!Array.isArray(vars)) {
         const varKeys = Object.keys(row)
@@ -510,6 +463,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
             return na - nb;
           });
 
+        // simpan SEMUA var ke varsMap (dipakai follow-up)
         vars = varKeys.map((k) => {
           varsMap[k] = row[k];
           return row[k];
@@ -520,23 +474,32 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         });
       }
 
+      // ⚠️ PENTING:
+      // Template WA yang sekarang cuma punya {{1}},
+      // jadi ke Meta kita kirim HANYA param pertama.
+      const varsForTemplate =
+        Array.isArray(vars) && vars.length ? [vars[0]] : [];
+
+      // follow_media per-orang (kolom terakhir CSV)
       const followMedia = row.follow_media || null;
 
       try {
+        // --- 4. Kirim template ke WA ---
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
-          vars,
+          vars: varsForTemplate,   // ⬅️ pakai yg sudah dipotong jadi 1
           phone_number_id: effectivePhoneId,
         });
 
         results.push(r);
 
+        // --- 5. Simpan result ke broadcast_recipients ---
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
+             broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
             broadcastId,
             phone,
@@ -562,9 +525,9 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
+             broadcast_id, phone, vars_json, follow_media,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,NOW())`,
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
           [
             broadcastId,
             phone,
@@ -578,6 +541,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       }
     }
 
+    // Ringkasan
     const total  = results.length;
     const ok     = results.filter((r) => r.ok).length;
     const failed = total - ok;
