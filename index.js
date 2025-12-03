@@ -335,28 +335,35 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 
     // === khusus document: set filename supaya di WA muncul nama & format ===
     if (mType === "document") {
-      let filename = media.filename; // boleh dikirim dari frontend
-
-      // Kalau frontend tidak kirim filename, coba tebak dari URL
-      if (!filename) {
-        try {
-          const urlObj   = new URL(media.link);
-          const pathname = urlObj.pathname || "";
-          const lastSeg  = pathname.split("/").filter(Boolean).pop() || "";
-
-          if (lastSeg && lastSeg.includes(".")) {
-            // contoh: /folder/Hasil_Asesmen_Ananda_Ani.pdf
-            filename = lastSeg;
-          } else {
-            // fallback default
+    
+        // baca filename dari media.filename (frontend / webhook)
+        let filename = media.filename;
+    
+        // fallback: coba ambil nama file dari URL
+        if (!filename) {
+          try {
+            const urlObj   = new URL(media.link);
+            const pathname = urlObj.pathname || "";
+            const lastSeg  = pathname.split("/").filter(Boolean).pop() || "";
+            filename = lastSeg && lastSeg.includes(".") ? lastSeg : "document.pdf";
+          } catch {
             filename = "document.pdf";
           }
-        } catch (e) {
-          filename = "document.pdf";
         }
-      }
-
-      baseMediaPayload.filename = filename;
+    
+        // pastikan ada ekstensi .pdf
+        if (!filename.toLowerCase().endsWith(".pdf")) {
+          filename = filename + ".pdf";
+        }
+    
+        baseMediaPayload.link = media.link;
+    
+        if (text) {
+          baseMediaPayload.caption = text;
+        }
+    
+        // 🔥 FIX PALING PENTING → masukkan filename ke payload
+        baseMediaPayload.filename = filename;
     }
 
     body = {
@@ -714,22 +721,12 @@ function applyFollowupTemplate(text, row) {
 function buildFilenameFromTemplate(tpl, row) {
   if (!tpl) return null;
 
-  // pakai applyFollowupTemplate supaya {{1}}, {{2}}, ... keisi dari var1, var2,...
   let name = applyFollowupTemplate(tpl, row);
+  name = name?.trim() || "document.pdf";
 
-  if (!name || !name.trim()) {
-    name = "document.pdf";
-  }
-
-  name = name.trim();
-
-  // pastikan ada ekstensi .pdf di belakang
   if (!name.toLowerCase().endsWith(".pdf")) {
-    name = name + ".pdf";
+    name += ".pdf";
   }
-
-  // opsional: rapikan spasi jadi underscore
-  // name = name.replace(/\s+/g, "_");
 
   return name;
 }
@@ -842,10 +839,11 @@ app.post("/kirimpesan/webhook", async (req, res) => {
         : null;
 
       if (linkedRow && linkedRow.follow_media) {
-        media = {
-          type: "document",
-          link: linkedRow.follow_media,
-        };
+      media = {
+        type: "document",
+        link: linkedRow.follow_media,
+        filename: finalFilename || "document.pdf"
+      };
         if (finalFilename) {
           media.filename = finalFilename;
         }
@@ -854,10 +852,11 @@ app.post("/kirimpesan/webhook", async (req, res) => {
         lastFollowupConfig.static_media.type &&
         lastFollowupConfig.static_media.link
       ) {
-        media = {
-          type: lastFollowupConfig.static_media.type,
-          link: lastFollowupConfig.static_media.link,
-        };
+      media = {
+        type: lastFollowupConfig.static_media.type,
+        link: lastFollowupConfig.static_media.link,
+        filename: finalFilename || lastFollowupConfig.static_media.filename || "document.pdf"
+      };
         if (finalFilename) {
           media.filename = finalFilename;
         }
