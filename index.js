@@ -899,21 +899,17 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 //  Dipanggil tiap menit oleh Apps Script
 // =======================================================
 app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
-  const client = await pgPool.connect();
-
   try {
-    // 1. Ambil broadcast yang sudah jatuh tempo
-    const { rows: broadcasts } = await client.query(
+    // 1) Ambil broadcast yang sudah jatuh tempo
+    const { rows: dueBroadcasts } = await pgPool.query(
       `SELECT *
          FROM broadcasts
         WHERE status = 'scheduled'
           AND scheduled_at IS NOT NULL
-          AND scheduled_at <= NOW()
-        ORDER BY scheduled_at ASC
-        LIMIT 10`
+          AND scheduled_at <= NOW()`
     );
 
-    if (!broadcasts.length) {
+    if (!dueBroadcasts.length) {
       return res.json({
         status: "ok",
         message: "No scheduled broadcasts due."
@@ -922,72 +918,106 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
 
     const ran = [];
 
-    for (const bc of broadcasts) {
-      // 2. Ambil semua penerima broadcast ini
-      const { rows: recs } = await client.query(
+    for (const bc of dueBroadcasts) {
+      // 2) Ambil semua penerima untuk broadcast ini
+      const { rows: recipients } = await pgPool.query(
         `SELECT *
            FROM broadcast_recipients
           WHERE broadcast_id = $1`,
         [bc.id]
       );
 
-      for (const r of recs) {
-        const phone = r.phone;
+      const results = [];
+
+      for (const rcp of recipients) {
+        const phone = rcp.phone;
         if (!phone) continue;
 
-        // --- KONVERSI vars_json → array terurut [var1, var2, ...] ---
-        const varsMap = r.vars_json || {};
-        const varKeys = Object.keys(varsMap)
-          .filter((k) => /^var\d+$/.test(k))
-          .sort((a, b) => {
-            const na = parseInt(a.replace("var", ""), 10);
-            const nb = parseInt(b.replace("var", ""), 10);
-            return na - nb;
-          });
+        // --------- BANGUN VARS DARI vars_json ----------
+        const varsMap = rcp.vars_json || {};
+        let vars = [];
 
-        const vars = varKeys.map((k) => varsMap[k]);
+        if (varsMap && typeof varsMap === "object") {
+          const keys = Object.keys(varsMap)
+            .filter((k) => /^var\d+$/.test(k))
+            .sort((a, b) => {
+              const na = parseInt(a.replace("var", ""), 10);
+              const nb = parseInt(b.replace("var", ""), 10);
+              return na - nb;
+            });
+
+          vars = keys.map((k) => varsMap[k]);
+        }
+
+        // 🔴 FIX PENTING:
+        // Template kamu (misal `pesan_konfirm`) cuma punya 1 {{1}},
+        // jadi ke Meta kita kirim hanya parameter pertama.
+        const varsForTemplate = vars.length ? [vars[0]] : [];
 
         try {
-          const waResp = await sendWaTemplate({
+          const r = await sendWaTemplate({
             phone,
             templateName: bc.template_name,
-            vars,
-            phone_number_id: bc.phone_number_id || undefined
+            vars: varsForTemplate,                  // ⬅️ PAKAI INI
+            phone_number_id: bc.phone_number_id || undefined,
           });
 
-          await client.query(
+          results.push({
+            phone,
+            ok: true,
+            status: r.status || null,
+          });
+
+          // Update status di broadcast_recipients
+          await pgPool.query(
             `UPDATE broadcast_recipients
-                SET template_ok          = TRUE,
-                    template_http_status = $2,
-                    template_error       = NULL
+                SET template_ok = $2,
+                    template_http_status = $3,
+                    template_error = $4
               WHERE id = $1`,
             [
-              r.id,
-              waResp.status || null
+              rcp.id,
+              true,
+              r.status || null,
+              null,
             ]
           );
         } catch (err) {
+          console.error(
+            "Scheduled broadcast error for",
+            phone,
+            err.response?.data || err.message
+          );
+
           const errorPayload = err.response?.data || err.message;
 
-          await client.query(
+          results.push({
+            phone,
+            ok: false,
+            status: err.response?.status || 500,
+            error: errorPayload,
+          });
+
+          await pgPool.query(
             `UPDATE broadcast_recipients
-                SET template_ok          = FALSE,
-                    template_http_status = $2,
-                    template_error       = $3
+                SET template_ok = $2,
+                    template_http_status = $3,
+                    template_error = $4
               WHERE id = $1`,
             [
-              r.id,
+              rcp.id,
+              false,
               err.response?.status || null,
               typeof errorPayload === "string"
                 ? { message: errorPayload }
-                : errorPayload
+                : errorPayload,
             ]
           );
         }
       }
 
-      // 3. Tandai broadcast sudah dijalankan
-      await client.query(
+      // 3) Tandai broadcast ini sudah dijalankan
+      await pgPool.query(
         `UPDATE broadcasts
             SET status = 'sent',
                 run_at = NOW()
@@ -997,16 +1027,20 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
 
       ran.push({
         broadcast_id: bc.id,
-        recipients: recs.length
+        recipients: results.length,
       });
     }
 
-    return res.json({ status: "ok", ran });
-  } catch (e) {
-    console.error("Error /broadcast/run-scheduled:", e);
-    return res.status(500).json({ status: "error", error: String(e) });
-  } finally {
-    client.release();
+    res.json({
+      status: "ok",
+      ran,
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
+    res.status(500).json({
+      status: "error",
+      error: String(err),
+    });
   }
 });
 
