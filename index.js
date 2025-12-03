@@ -684,27 +684,28 @@ app.post("/kirimpesan/custom", async (req, res) => {
     // 1) Kirim ke WhatsApp API
     const waRes = await sendCustomMessage({ to, text, media, phone_number_id });
 
-    // 2) Simpan ke tabel inbox_messages sebagai pesan OUTGOING
-    //    (samakan nama kolom dengan yang di DB kamu)
+    // 2) Simpan sebagai pesan OUTGOING di inbox_messages
     try {
-      await pool.query(
+      await pgPool.query(
         `
-        INSERT INTO inbox_messages (at, phone, message_type, message_text, raw_json)
-        VALUES (NOW(), $1, $2, $3, $4)
+        INSERT INTO inbox_messages (at, phone, message_type, message_text, is_quick_reply, broadcast_id, raw_json)
+        VALUES (NOW(), $1, $2, $3, $4, $5, $6)
         `,
         [
           to,
-          media ? "outgoing_media" : "outgoing",       // ini yg nanti dipakai di frontend
+          media ? "outgoing_media" : "outgoing", // penting buat deteksi bubble hijau
           text || null,
+          false,          // is_quick_reply
+          null,           // broadcast_id
           JSON.stringify(waRes || {}),
         ]
       );
     } catch (dbErr) {
       console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
-      // jangan throw, supaya user tetap dapet response "ok" kalau WA-nya sukses
+      // jangan throw supaya response ke FE tetap ok
     }
 
-    // 3) Response ke frontend
+    // 3) Balikkan response ke FE
     res.json({
       status: "ok",
       to,
