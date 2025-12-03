@@ -841,6 +841,8 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       ? buildFilenameFromTemplate(filenameTpl, row)
       : "document.pdf";
 
+    console.log("DEBUG followup filenameTpl:", filenameTpl, "finalFilename:", finalFilename);
+    
     // PRIORITAS:
     // 1) follow_media di row (khusus nomor itu)
     // 2) static_media dari config (sama untuk semua)
