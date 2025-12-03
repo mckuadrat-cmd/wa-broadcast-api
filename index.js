@@ -845,10 +845,7 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
     // template filename dari frontend (boleh ada {{1}}, {{2}})
     const filenameTpl  = lastFollowupConfig.static_media?.filename || null;
-    const finalFilename = filenameTpl
-      ? buildFilenameFromTemplate(filenameTpl, row)
-      : "document.pdf";
-    
+    const finalFilename = buildFilenameFromTemplate(filenameTpl, row);
     console.log("DEBUG followup filenameTpl:", filenameTpl, "finalFilename:", finalFilename);
     
     // PRIORITAS:
