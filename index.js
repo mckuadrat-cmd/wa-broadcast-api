@@ -694,383 +694,169 @@ app.post("/kirimpesan/custom", async (req, res) => {
 });
 
 // =======================================================
-// 8) WEBHOOK WHATSAPP (LANGSUNG KE BACKEND, TANPA APPS SCRIPT)
-//    GET  /kirimpesan/webhook  → verifikasi
-//    POST /kirimpesan/webhook  → handle pesan masuk (quick reply "Bersedia")
+// 8) WEBHOOK WHATSAPP – FIXED VERSION
 // =======================================================
 
+// Replace {{1}}, {{2}} in follow-up text
 function applyFollowupTemplate(text, row) {
   if (!text) return "";
   if (!row) return text;
 
-  const varMap = {};
-
-  Object.keys(row).forEach((k) => {
-    const m = /^var(\d+)$/.exec(k);
-    if (m && row[k] != null) {
-      varMap[m[1]] = String(row[k]);
-    }
-  });
-
-  return text.replace(/\{\{(\d+)\}\}/g, (_, idx) => {
-    return Object.prototype.hasOwnProperty.call(varMap, idx) ? varMap[idx] : "";
+  return text.replace(/\{\{(\d+)\}\}/g, (_, n) => {
+    const key = "var" + n;
+    return row[key] ? String(row[key]) : "";
   });
 }
 
-// Bangun nama file dari template, boleh pakai {{1}}, {{2}}, dll
-function buildFilenameFromTemplate(tpl, row) {
-  if (!tpl) return null;
-
-  let name = applyFollowupTemplate(tpl, row);
-  name = name?.trim() || "document.pdf";
-
-  if (!name.toLowerCase().endsWith(".pdf")) {
-    name += ".pdf";
-  }
-
+// Build filename dynamic based on {{var}}
+function buildFilenameFromTemplate(filenameTpl, row) {
+  if (!filenameTpl) return "document.pdf";
+  let name = applyFollowupTemplate(filenameTpl, row).trim();
+  if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
   return name;
 }
 
-// Verifikasi webhook (saat set callback URL di Facebook Developer)
+
+// WEBHOOK VERIFICATION
 app.get("/kirimpesan/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === WEBHOOK_VERIFY_TOKEN) {
-    console.log("✅ Webhook verified by Facebook");
-    return res.status(200).send(challenge);
+  if (
+    req.query["hub.mode"] === "subscribe" &&
+    req.query["hub.verify_token"] === WEBHOOK_VERIFY_TOKEN
+  ) {
+    return res.status(200).send(req.query["hub.challenge"]);
   }
-
   return res.sendStatus(403);
 });
 
-// Terima event message dari WhatsApp
+
+// =======================================================
+// POST WEBHOOK - FIXED
+// =======================================================
 app.post("/kirimpesan/webhook", async (req, res) => {
-  console.log("📩 Incoming webhook:", JSON.stringify(req.body, null, 2));
+  console.log("📥 WH Incoming:", JSON.stringify(req.body, null, 2));
 
   try {
-    const entry   = req.body.entry?.[0];
-    const change  = entry?.changes?.[0];
-    const value   = change?.value;
-    const messages = value?.messages;
+    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!msg) return res.sendStatus(200);
 
-    if (!messages || !messages.length) {
-      return res.sendStatus(200);
-    }
-
-    const msg  = messages[0];
-    const from = msg.from; // nomor pengirim
-
+    const from = msg.from;
     let triggerText = "";
 
-    if (msg.type === "text" && msg.text) {
-      triggerText = msg.text.body || "";
-    } else if (msg.type === "button" && msg.button) {
-      triggerText = msg.button.text || msg.button.payload || "";
-    } else if (msg.type === "interactive" && msg.interactive) {
-      if (msg.interactive.button_reply) {
-        triggerText =
-          msg.interactive.button_reply.title || msg.interactive.button_reply.id || "";
-      } else if (msg.interactive.list_reply) {
-        triggerText =
-          msg.interactive.list_reply.title || msg.interactive.list_reply.id || "";
-      }
+    if (msg.type === "interactive" && msg.interactive?.button_reply) {
+      triggerText = msg.interactive.button_reply.title;
+    } else if (msg.type === "button") {
+      triggerText = msg.button.text;
+    } else if (msg.type === "text") {
+      triggerText = msg.text.body;
     }
 
-    console.log("Webhook message type:", msg.type, "from:", from, "triggerText:", triggerText);
+    // Mapping ke row
+    const mapEntry = lastBroadcastRowsByPhone[from] || null;
+    const row = mapEntry?.row || null;
+    const broadcastId = mapEntry?.broadcastId || null;
 
-    // Mapping ke broadcast terakhir (kalau ada)
-    const mapEntry          = lastBroadcastRowsByPhone[String(from)] || null;
-    const linkedRow         = mapEntry ? mapEntry.row : null;
-    const linkedBroadcastId = mapEntry ? mapEntry.broadcastId : null;
-
-    // ========== SIMPAN KE TABEL inbox_messages ==========
+    // Simpan inbox
     try {
-      const isQuickReply =
-        !!triggerText && (msg.type === "button" || msg.type === "interactive");
-
       await pgPool.query(
         `INSERT INTO inbox_messages
-           (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
         [
           from,
           msg.type || null,
-          triggerText || null,
-          req.body || null,
-          linkedBroadcastId || null,
-          isQuickReply
+          triggerText,
+          req.body,
+          broadcastId,
+          msg.type === "interactive" || msg.type === "button"
         ]
       );
     } catch (e) {
-      console.error("Error inserting inbox_messages:", e);
+      console.error("Insert inbox_messages error:", e);
     }
-    // =====================================================
 
-    if (!triggerText) {
+    if (!triggerText?.toUpperCase().includes("BERSEDIA")) {
       return res.sendStatus(200);
     }
 
-    const upperTxt = triggerText.toUpperCase();
+    if (!lastFollowupConfig?.text) {
+      console.log("No followup config → stop.");
+      return res.sendStatus(200);
+    }
 
-    // Contoh: hanya respon kalau mengandung "BERSEDIA"
-    if (upperTxt.includes("BERSEDIA")) {
-      console.log("🔥 Trigger BERSEDIA dari", from);
+    // 🔥 APPLY VARIABEL {{1}},{{2}}
+    const text = applyFollowupTemplate(lastFollowupConfig.text, row);
 
-      // Kalau follow-up tidak diset dari frontend → jangan kirim apa-apa
-      if (!lastFollowupConfig || !lastFollowupConfig.text) {
-        console.log("No followup config set, ignoring.");
-        return res.sendStatus(200);
-      }
+    // 🔥 SIAPKAN MEDIA
+    let media = null;
 
-      // Text follow-up dengan {{1}}, {{2}}, ... diisi dari var1, var2, ... di row
-      const text = applyFollowupTemplate(lastFollowupConfig.text, linkedRow);
+    const filenameTpl = lastFollowupConfig.static_media?.filename || null;
+    const finalFilename = filenameTpl
+      ? buildFilenameFromTemplate(filenameTpl, row)
+      : "document.pdf";
 
-      // Attachment:
-      // 1) kalau row punya follow_media → pakai itu (document)
-      // 2) kalau tidak, tapi followup.static_media ada → pakai itu
-      let media = null;
-
-      // siapkan filename template (boleh berisi {{1}}, {{2}}, dll)
-      const filenameTpl   = lastFollowupConfig.static_media?.filename || null;
-      const finalFilename = filenameTpl
-        ? buildFilenameFromTemplate(filenameTpl, linkedRow)
-        : null;
-
-      if (linkedRow && linkedRow.follow_media) {
+    // PRIORITAS:
+    // 1) row.follow_media (per orang)
+    // 2) static_media (default)
+    if (row?.follow_media) {
       media = {
         type: "document",
-        link: linkedRow.follow_media,
-        filename: finalFilename || "document.pdf"
+        link: row.follow_media,
+        filename: finalFilename
       };
-        if (finalFilename) {
-          media.filename = finalFilename;
-        }
-      } else if (
-        lastFollowupConfig.static_media &&
-        lastFollowupConfig.static_media.type &&
-        lastFollowupConfig.static_media.link
-      ) {
+    } else if (lastFollowupConfig.static_media?.link) {
       media = {
-        type: lastFollowupConfig.static_media.type,
+        type: lastFollowupConfig.static_media.type || "document",
         link: lastFollowupConfig.static_media.link,
-        filename: finalFilename || lastFollowupConfig.static_media.filename || "document.pdf"
+        filename: finalFilename
       };
-        if (finalFilename) {
-          media.filename = finalFilename;
-        }
-      }
+    }
 
-      const payload = { to: from, text };
-      if (media) payload.media = media;
+    // =======================================
+    // 🔥 FIX: KIRIM PESAN FORMAT META YANG BENAR
+    // =======================================
+    const payload = {
+      messaging_product: "whatsapp",
+      to: from
+    };
 
-      try {
-        const data = await sendCustomMessage(payload);
-        console.log("Follow-up sent:", JSON.stringify(data, null, 2));
+    // Ada media → kirim document + caption
+    if (media) {
+      payload.type = "document";
+      payload.document = {
+        link: media.link,
+        filename: media.filename,
+        caption: text
+      };
+    } else {
+      payload.type = "text";
+      payload.text = { body: text };
+    }
 
-        // Catat ke Postgres
-        if (linkedBroadcastId) {
-          await pgPool.query(
-            `INSERT INTO broadcast_followups (
-               id, broadcast_id, phone, text, has_media, media_link,
-               status, error, at
-             ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
-              linkedBroadcastId,
-              from,
-              text,
-              !!media,
-              media ? media.link : null,
-              "ok",
-              null,
-              new Date().toISOString()
-            ]
-          );
-        }
-      } catch (err) {
-        console.error("Error sending follow-up:", err.response?.data || err.message);
+    const sendRes = await sendWhatsApp(payload);
+    console.log("Follow-up sent:", sendRes);
 
-        if (linkedBroadcastId) {
-          const errorPayload = err.response?.data || err.message;
-          await pgPool.query(
-            `INSERT INTO broadcast_followups (
-               id, broadcast_id, phone, text, has_media, media_link,
-               status, error, at
-             ) VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8)`,
-            [
-              linkedBroadcastId,
-              from,
-              text,
-              !!media,
-              media ? media.link : null,
-              "error",
-              typeof errorPayload === "string"
-                ? { message: errorPayload }
-                : errorPayload,
-              new Date().toISOString()
-            ]
-          );
-        }
-      }
+    // Simpan ke DB
+    if (broadcastId) {
+      await pgPool.query(
+        `INSERT INTO broadcast_followups
+         (id, broadcast_id, phone, text, has_media, media_link, status, error, at)
+         VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'ok',NULL,$6)`,
+        [
+          broadcastId,
+          from,
+          text,
+          !!media,
+          media?.link || null,
+          new Date().toISOString()
+        ]
+      );
     }
 
     return res.sendStatus(200);
+
   } catch (err) {
-    console.error("Error /kirimpesan/webhook POST:", err);
+    console.error("Webhook ERROR:", err);
     return res.sendStatus(500);
-  }
-});
-
-// =======================================================
-//  RUN SCHEDULED BROADCASTS
-//  GET /kirimpesan/broadcast/run-scheduled
-//  Dipanggil tiap menit oleh Apps Script
-// =======================================================
-app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
-  try {
-    // 1) Ambil broadcast yang sudah jatuh tempo
-    const { rows: dueBroadcasts } = await pgPool.query(
-      `SELECT *
-         FROM broadcasts
-        WHERE status = 'scheduled'
-          AND scheduled_at IS NOT NULL
-          AND scheduled_at <= NOW()`
-    );
-
-    if (!dueBroadcasts.length) {
-      return res.json({
-        status: "ok",
-        message: "No scheduled broadcasts due."
-      });
-    }
-
-    const ran = [];
-
-    for (const bc of dueBroadcasts) {
-      // 2) Ambil semua penerima untuk broadcast ini
-      const { rows: recipients } = await pgPool.query(
-        `SELECT *
-           FROM broadcast_recipients
-          WHERE broadcast_id = $1`,
-        [bc.id]
-      );
-
-      const results = [];
-
-      for (const rcp of recipients) {
-        const phone = rcp.phone;
-        if (!phone) continue;
-
-        // --------- BANGUN VARS DARI vars_json ----------
-        const varsMap = rcp.vars_json || {};
-        let vars = [];
-
-        if (varsMap && typeof varsMap === "object") {
-          const keys = Object.keys(varsMap)
-            .filter((k) => /^var\d+$/.test(k))
-            .sort((a, b) => {
-              const na = parseInt(a.replace("var", ""), 10);
-              const nb = parseInt(b.replace("var", ""), 10);
-              return na - nb;
-            });
-
-          vars = keys.map((k) => varsMap[k]);
-        }
-
-        // 🔴 FIX PENTING:
-        // Template kamu (misal `pesan_konfirm`) cuma punya 1 {{1}},
-        // jadi ke Meta kita kirim hanya parameter pertama.
-        const paramCount = await getTemplateParamCount(bc.template_name);
-        const varsForTemplate = vars.slice(0, paramCount);
-
-        try {
-          const r = await sendWaTemplate({
-            phone,
-            templateName: bc.template_name,
-            vars: varsForTemplate,                  // ⬅️ PAKAI INI
-            phone_number_id: bc.phone_number_id || undefined,
-          });
-
-          results.push({
-            phone,
-            ok: true,
-            status: r.status || null,
-          });
-
-          // Update status di broadcast_recipients
-          await pgPool.query(
-            `UPDATE broadcast_recipients
-                SET template_ok = $2,
-                    template_http_status = $3,
-                    template_error = $4
-              WHERE id = $1`,
-            [
-              rcp.id,
-              true,
-              r.status || null,
-              null,
-            ]
-          );
-        } catch (err) {
-          console.error(
-            "Scheduled broadcast error for",
-            phone,
-            err.response?.data || err.message
-          );
-
-          const errorPayload = err.response?.data || err.message;
-
-          results.push({
-            phone,
-            ok: false,
-            status: err.response?.status || 500,
-            error: errorPayload,
-          });
-
-          await pgPool.query(
-            `UPDATE broadcast_recipients
-                SET template_ok = $2,
-                    template_http_status = $3,
-                    template_error = $4
-              WHERE id = $1`,
-            [
-              rcp.id,
-              false,
-              err.response?.status || null,
-              typeof errorPayload === "string"
-                ? { message: errorPayload }
-                : errorPayload,
-            ]
-          );
-        }
-      }
-
-      // 3) Tandai broadcast ini sudah dijalankan
-      await pgPool.query(
-        `UPDATE broadcasts
-            SET status = 'sent',
-                run_at = NOW()
-          WHERE id = $1`,
-        [bc.id]
-      );
-
-      ran.push({
-        broadcast_id: bc.id,
-        recipients: results.length,
-      });
-    }
-
-    res.json({
-      status: "ok",
-      ran,
-    });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
-    res.status(500).json({
-      status: "error",
-      error: String(err),
-    });
   }
 });
 
