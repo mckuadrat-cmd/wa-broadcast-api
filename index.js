@@ -323,66 +323,59 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
   let body;
 
   if (media && media.type && media.link) {
-    const mType = media.type.toLowerCase(); // "document", "image", "video", "audio"
+    const mType = String(media.type).toLowerCase(); // "document", "image", ...
 
-    const baseMediaPayload = {
-      link: media.link,
-    };
-
-    if (text) {
-      baseMediaPayload.caption = text;
-    }
-
-    // === khusus document: set filename supaya di WA muncul nama & format ===
     if (mType === "document") {
-    
-        // baca filename dari media.filename (frontend / webhook)
-        let filename = media.filename;
-    
-        // fallback: coba ambil nama file dari URL
-        if (!filename) {
-          try {
-            const urlObj   = new URL(media.link);
-            const pathname = urlObj.pathname || "";
-            const lastSeg  = pathname.split("/").filter(Boolean).pop() || "";
-            filename = lastSeg && lastSeg.includes(".") ? lastSeg : "document.pdf";
-          } catch {
-            filename = "document.pdf";
-          }
-        }
-    
-        // pastikan ada ekstensi .pdf
-        if (!filename.toLowerCase().endsWith(".pdf")) {
-          filename = filename + ".pdf";
-        }
-    
-        baseMediaPayload.link = media.link;
-    
-        if (text) {
-          baseMediaPayload.caption = text;
-        }
-    
-        // 🔥 FIX PALING PENTING → masukkan filename ke payload
-        baseMediaPayload.filename = filename;
-    }
+      // 🔥 PAKAI filename dari media.filename
+      let filename = (media.filename || "").trim();
 
-    body = {
-      messaging_product: "whatsapp",
-      to,
-      type: mType,
-      [mType]: baseMediaPayload,
-    };
+      // kalau kosong → default
+      if (!filename) {
+        filename = "document.pdf";
+      }
+
+      // pastikan ada .pdf di belakang
+      if (!filename.toLowerCase().endsWith(".pdf")) {
+        filename += ".pdf";
+      }
+
+      body = {
+        messaging_product: "whatsapp",
+        to,
+        type: "document",
+        document: {
+          link: media.link,
+          filename,                // ⬅️ INI YANG DILIHAT WA
+          ...(text ? { caption: text } : {}),
+        },
+      };
+    } else {
+      // image / video / dll
+      body = {
+        messaging_product: "whatsapp",
+        to,
+        type: mType,
+        [mType]: {
+          link: media.link,
+          ...(text ? { caption: text } : {}),
+        },
+      };
+    }
   } else {
+    // text only
     body = {
       messaging_product: "whatsapp",
       to,
       type: "text",
       text: {
-        preview_url: false,
         body: text || "",
+        preview_url: false,
       },
     };
   }
+
+  // DEBUG: cek apa yang benar-benar dikirim
+  console.log("DEBUG sendCustomMessage body:", JSON.stringify(body, null, 2));
 
   const resp = await axios.post(url, body, {
     headers: {
