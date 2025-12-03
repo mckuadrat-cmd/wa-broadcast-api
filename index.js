@@ -53,6 +53,36 @@ app.get("/", (req, res) => {
   res.send("MCKuadrat WA Broadcast API — ONLINE ✅");
 });
 
+async function getTemplateParamCount(templateName) {
+  try {
+    const resp = await axios.get(
+      `https://graph.facebook.com/v19.0/${process.env.WABA_BUSINESS_ID}/message_templates`,
+      {
+        params: {
+          name: templateName
+        },
+        headers: {
+          Authorization: `Bearer ${process.env.WABA_TOKEN}`
+        }
+      }
+    );
+
+    const t = resp.data?.data?.[0];
+    if (!t) return 1; // default 1 parameter
+
+    // cari body template
+    const bodyComponent = t.components?.find(c => c.type === "BODY");
+    if (!bodyComponent || !bodyComponent.text) return 0;
+
+    // hitung jumlah {{x}} dari body
+    const matches = bodyComponent.text.match(/\{\{\d+\}\}/g);
+    return matches ? matches.length : 0;
+  } catch (err) {
+    console.error("Gagal ambil template metadata:", err.response?.data || err);
+    return 1; // fallback
+  }
+}
+
 // =======================================================
 // HELPER: Ambil daftar phone_numbers dari WABA
 // =======================================================
@@ -538,8 +568,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       // ⚠️ PENTING:
       // Template WA sekarang cuma punya {{1}},
       // jadi ke Meta kita kirim HANYA parameter pertama.
-      const varsForTemplate =
-        Array.isArray(vars) && vars.length ? [vars[0]] : [];
+      const paramCount = await getTemplateParamCount(template_name);
+      const varsForTemplate = vars.slice(0, paramCount);
 
       const followMedia = row.follow_media || null;
 
@@ -952,7 +982,8 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         // 🔴 FIX PENTING:
         // Template kamu (misal `pesan_konfirm`) cuma punya 1 {{1}},
         // jadi ke Meta kita kirim hanya parameter pertama.
-        const varsForTemplate = vars.length ? [vars[0]] : [];
+        const paramCount = await getTemplateParamCount(bc.template_name);
+        const varsForTemplate = vars.slice(0, paramCount);
 
         try {
           const r = await sendWaTemplate({
