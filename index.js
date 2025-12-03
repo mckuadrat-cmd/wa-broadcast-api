@@ -693,136 +693,147 @@ app.post("/kirimpesan/custom", async (req, res) => {
   }
 });
 
-// Helper umum untuk kirim payload WhatsApp mentah (dipakai di webhook follow-up)
-async function sendWhatsApp(payload) {
-  const phoneId = DEFAULT_PHONE_NUMBER_ID;
-  if (!phoneId) {
-    throw new Error("PHONE_NUMBER_ID belum diset");
-  }
-
-  const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
-
-  const resp = await axios.post(url, payload, {
-    headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  return resp.data;
-}
-
 // =======================================================
-// 8) WEBHOOK WHATSAPP – FIXED VERSION
+// 8) WEBHOOK WHATSAPP – BALAS "BERSEDIA" KIRIM PDF
 // =======================================================
 
-// Replace {{1}}, {{2}} in follow-up text
+// Gantikan {{1}}, {{2}}, ... di teks follow-up dengan var1, var2, ...
 function applyFollowupTemplate(text, row) {
   if (!text) return "";
   if (!row) return text;
 
   return text.replace(/\{\{(\d+)\}\}/g, (_, n) => {
     const key = "var" + n;
-    return row[key] ? String(row[key]) : "";
+    return row[key] != null ? String(row[key]) : "";
   });
 }
 
-// Build filename dynamic based on {{var}}
+// Bangun nama file dari template (mis: "Surat penerimaan {{1}}")
 function buildFilenameFromTemplate(filenameTpl, row) {
   if (!filenameTpl) return "document.pdf";
   let name = applyFollowupTemplate(filenameTpl, row).trim();
-  if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
+  if (!name.toLowerCase().endsWith(".pdf")) {
+    name += ".pdf";
+  }
   return name;
 }
 
-
-// WEBHOOK VERIFICATION
+// ========== VERIFIKASI WEBHOOK (saat set di Facebook Developer) ==========
 app.get("/kirimpesan/webhook", (req, res) => {
-  if (
-    req.query["hub.mode"] === "subscribe" &&
-    req.query["hub.verify_token"] === WEBHOOK_VERIFY_TOKEN
-  ) {
-    return res.status(200).send(req.query["hub.challenge"]);
+  const mode      = req.query["hub.mode"];
+  const token     = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === WEBHOOK_VERIFY_TOKEN && challenge) {
+    console.log("✅ Webhook verified");
+    return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-
-// =======================================================
-// POST WEBHOOK - FIXED
-// =======================================================
+// ========== HANDLE PESAN MASUK (BUTTON / TEXT / INTERACTIVE) ==========
 app.post("/kirimpesan/webhook", async (req, res) => {
   console.log("📥 WH Incoming:", JSON.stringify(req.body, null, 2));
 
   try {
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) return res.sendStatus(200);
+    const entry   = req.body.entry?.[0];
+    const change  = entry?.changes?.[0];
+    const value   = change?.value;
+    const messages = value?.messages;
 
-    const from = msg.from;
-    let triggerText = "";
-
-    if (msg.type === "interactive" && msg.interactive?.button_reply) {
-      triggerText = msg.interactive.button_reply.title;
-    } else if (msg.type === "button") {
-      triggerText = msg.button.text;
-    } else if (msg.type === "text") {
-      triggerText = msg.text.body;
+    if (!messages || !messages.length) {
+      return res.sendStatus(200);
     }
 
-    // Mapping ke row
-    const mapEntry = lastBroadcastRowsByPhone[from] || null;
-    const row = mapEntry?.row || null;
-    const broadcastId = mapEntry?.broadcastId || null;
+    const msg   = messages[0];
+    const from  = msg.from;         // nomor pengirim (628xx…)
+    let triggerText = "";
 
-    // Simpan inbox
+    // Ambil teks yang dikirim user (button / interactive / text biasa)
+    if (msg.type === "text" && msg.text) {
+      triggerText = msg.text.body || "";
+    } else if (msg.type === "button" && msg.button) {
+      triggerText = msg.button.text || msg.button.payload || "";
+    } else if (msg.type === "interactive" && msg.interactive) {
+      if (msg.interactive.button_reply) {
+        triggerText =
+          msg.interactive.button_reply.title ||
+          msg.interactive.button_reply.id ||
+          "";
+      } else if (msg.interactive.list_reply) {
+        triggerText =
+          msg.interactive.list_reply.title ||
+          msg.interactive.list_reply.id ||
+          "";
+      }
+    }
+
+    console.log("Type:", msg.type, "from:", from, "text:", triggerText);
+
+    // ====== MAP KE ROW BROADCAST TERAKHIR ======
+    // (diisi waktu /kirimpesan/broadcast kirim atau run-scheduled)
+    const mapEntry    = lastBroadcastRowsByPhone[String(from)] || null;
+    const row         = mapEntry ? mapEntry.row : null;
+    const broadcastId = mapEntry ? mapEntry.broadcastId : null;
+
+    // ====== SIMPAN KE inbox_messages SELALU ======
     try {
+      const isQuickReply =
+        !!triggerText && (msg.type === "button" || msg.type === "interactive");
+
       await pgPool.query(
         `INSERT INTO inbox_messages
-         (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply)
+           (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply)
          VALUES ($1,$2,$3,$4,$5,$6)`,
         [
           from,
           msg.type || null,
-          triggerText,
-          req.body,
-          broadcastId,
-          msg.type === "interactive" || msg.type === "button"
+          triggerText || null,
+          req.body || null,
+          broadcastId || null,
+          isQuickReply
         ]
       );
     } catch (e) {
       console.error("Insert inbox_messages error:", e);
     }
 
-    if (!triggerText?.toUpperCase().includes("BERSEDIA")) {
+    // ====== KALAU BUKAN "BERSEDIA" → TIDAK BALAS APA-APA ======
+    if (!triggerText || !triggerText.toUpperCase().includes("BERSEDIA")) {
       return res.sendStatus(200);
     }
 
-    if (!lastFollowupConfig?.text) {
-      console.log("No followup config → stop.");
+    // ====== KALAU TIDAK ADA CONFIG FOLLOW-UP → JUGA DIEM ======
+    if (!lastFollowupConfig || !lastFollowupConfig.text) {
+      console.log("No followup config, ignore.");
       return res.sendStatus(200);
     }
 
-    // 🔥 APPLY VARIABEL {{1}},{{2}}
+    // ====== BANGUN TEKS FOLLOW-UP DARI TEMPLATE {{1}},{{2}} ======
     const text = applyFollowupTemplate(lastFollowupConfig.text, row);
 
-    // 🔥 SIAPKAN MEDIA
+    // ====== SIAPKAN MEDIA (PDF) ======
     let media = null;
 
-    const filenameTpl = lastFollowupConfig.static_media?.filename || null;
+    // template filename dari frontend (boleh ada {{1}}, {{2}})
+    const filenameTpl  = lastFollowupConfig.static_media?.filename || null;
     const finalFilename = filenameTpl
       ? buildFilenameFromTemplate(filenameTpl, row)
       : "document.pdf";
 
     // PRIORITAS:
-    // 1) row.follow_media (per orang)
-    // 2) static_media (default)
-    if (row?.follow_media) {
+    // 1) follow_media di row (khusus nomor itu)
+    // 2) static_media dari config (sama untuk semua)
+    if (row && row.follow_media) {
       media = {
         type: "document",
         link: row.follow_media,
         filename: finalFilename
       };
-    } else if (lastFollowupConfig.static_media?.link) {
+    } else if (
+      lastFollowupConfig.static_media &&
+      lastFollowupConfig.static_media.link
+    ) {
       media = {
         type: lastFollowupConfig.static_media.type || "document",
         link: lastFollowupConfig.static_media.link,
@@ -830,49 +841,58 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       };
     }
 
-    // =======================================
-    // 🔥 FIX: KIRIM PESAN FORMAT META YANG BENAR
-    // =======================================
-    const payload = {
-      messaging_product: "whatsapp",
-      to: from
-    };
+    // ====== KIRIM KE WHATSAPP MENGGUNAKAN sendCustomMessage() ======
+    // (fungsi ini sudah ada di atas dan sudah benar soal filename & caption)
+    try {
+      const waRes = await sendCustomMessage({
+        to: from,
+        text,
+        media,
+        // pakai default PHONE_NUMBER_ID
+      });
 
-    // Ada media → kirim document + caption
-    if (media) {
-      payload.type = "document";
-      payload.document = {
-        link: media.link,
-        filename: media.filename,
-        caption: text
-      };
-    } else {
-      payload.type = "text";
-      payload.text = { body: text };
-    }
+      console.log("Follow-up sent:", JSON.stringify(waRes, null, 2));
 
-    const sendRes = await sendWhatsApp(payload);
-    console.log("Follow-up sent:", sendRes);
+      if (broadcastId) {
+        await pgPool.query(
+          `INSERT INTO broadcast_followups
+             (id, broadcast_id, phone, text, has_media, media_link, status, error, at)
+           VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'ok',NULL,$6)`,
+          [
+            broadcastId,
+            from,
+            text,
+            !!media,
+            media ? media.link : null,
+            new Date().toISOString()
+          ]
+        );
+      }
+    } catch (err) {
+      console.error("Error sending follow-up:", err.response?.data || err.message);
 
-    // Simpan ke DB
-    if (broadcastId) {
-      await pgPool.query(
-        `INSERT INTO broadcast_followups
-         (id, broadcast_id, phone, text, has_media, media_link, status, error, at)
-         VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'ok',NULL,$6)`,
-        [
-          broadcastId,
-          from,
-          text,
-          !!media,
-          media?.link || null,
-          new Date().toISOString()
-        ]
-      );
+      if (broadcastId) {
+        const errorPayload = err.response?.data || err.message;
+        await pgPool.query(
+          `INSERT INTO broadcast_followups
+             (id, broadcast_id, phone, text, has_media, media_link, status, error, at)
+           VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'error',$6,$7)`,
+          [
+            broadcastId,
+            from,
+            text,
+            !!media,
+            media ? media.link : null,
+            typeof errorPayload === "string"
+              ? { message: errorPayload }
+              : errorPayload,
+            new Date().toISOString()
+          ]
+        );
+      }
     }
 
     return res.sendStatus(200);
-
   } catch (err) {
     console.error("Webhook ERROR:", err);
     return res.sendStatus(500);
