@@ -896,82 +896,88 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 // =======================================================
 //  RUN SCHEDULED BROADCASTS
 //  GET /kirimpesan/broadcast/run-scheduled
-//  Dipanggil oleh Railway Cron setiap 1 menit
+//  Dipanggil tiap menit oleh Apps Script
 // =======================================================
 app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
-  try {
-    console.log("⏰ Checking scheduled broadcasts...");
+  const client = await pgPool.connect();
 
-    const due = await pgPool.query(
+  try {
+    // 1. Ambil broadcast yang sudah jatuh tempo
+    const { rows: broadcasts } = await client.query(
       `SELECT *
-       FROM broadcasts
-       WHERE status = 'scheduled'
-         AND scheduled_at IS NOT NULL
-         AND scheduled_at <= NOW()
-       ORDER BY scheduled_at ASC
-       LIMIT 3`
+         FROM broadcasts
+        WHERE status = 'scheduled'
+          AND scheduled_at IS NOT NULL
+          AND scheduled_at <= NOW()
+        ORDER BY scheduled_at ASC
+        LIMIT 10`
     );
 
-    if (!due.rows.length) {
-      return res.json({ status: "ok", message: "No scheduled broadcasts due." });
+    if (!broadcasts.length) {
+      return res.json({
+        status: "ok",
+        message: "No scheduled broadcasts due."
+      });
     }
 
-    const results = [];
+    const ran = [];
 
-    for (const b of due.rows) {
-      // Tandai sebagai running
-      await pgPool.query(
-        `UPDATE broadcasts SET status='running' WHERE id=$1`,
-        [b.id]
+    for (const bc of broadcasts) {
+      // 2. Ambil semua penerima broadcast ini
+      const { rows: recs } = await client.query(
+        `SELECT *
+           FROM broadcast_recipients
+          WHERE broadcast_id = $1`,
+        [bc.id]
       );
 
-      // Ambil semua penerima
-      const r = await pgPool.query(
-        `SELECT * FROM broadcast_recipients
-         WHERE broadcast_id=$1
-         ORDER BY id`,
-        [b.id]
-      );
+      for (const r of recs) {
+        const phone = r.phone;
+        if (!phone) continue;
 
-      for (const row of r.rows) {
-        try {
-          // Convert vars_json → array vars
-          let vars = [];
-          const varMap = row.vars_json || {};
-          const keys = Object.keys(varMap).sort((a, b) => {
-            const na = parseInt(a.replace("var",""), 10);
-            const nb = parseInt(b.replace("var",""), 10);
+        // --- KONVERSI vars_json → array terurut [var1, var2, ...] ---
+        const varsMap = r.vars_json || {};
+        const varKeys = Object.keys(varsMap)
+          .filter((k) => /^var\d+$/.test(k))
+          .sort((a, b) => {
+            const na = parseInt(a.replace("var", ""), 10);
+            const nb = parseInt(b.replace("var", ""), 10);
             return na - nb;
           });
-          keys.forEach(k => vars.push(varMap[k]));
 
-          const send = await sendWaTemplate({
-            phone: row.phone,
-            templateName: b.template_name,
+        const vars = varKeys.map((k) => varsMap[k]);
+
+        try {
+          const waResp = await sendWaTemplate({
+            phone,
+            templateName: bc.template_name,
             vars,
-            phone_number_id: b.phone_number_id
+            phone_number_id: bc.phone_number_id || undefined
           });
 
-          await pgPool.query(
+          await client.query(
             `UPDATE broadcast_recipients
-             SET template_ok=true,
-                 template_http_status=$2,
-                 template_error=null
-             WHERE id=$1`,
-            [row.id, send.status || 200]
+                SET template_ok          = TRUE,
+                    template_http_status = $2,
+                    template_error       = NULL
+              WHERE id = $1`,
+            [
+              r.id,
+              waResp.status || null
+            ]
           );
         } catch (err) {
           const errorPayload = err.response?.data || err.message;
 
-          await pgPool.query(
+          await client.query(
             `UPDATE broadcast_recipients
-             SET template_ok=false,
-                 template_http_status=$2,
-                 template_error=$3
-             WHERE id=$1`,
+                SET template_ok          = FALSE,
+                    template_http_status = $2,
+                    template_error       = $3
+              WHERE id = $1`,
             [
-              row.id,
-              err.response?.status || 500,
+              r.id,
+              err.response?.status || null,
               typeof errorPayload === "string"
                 ? { message: errorPayload }
                 : errorPayload
@@ -980,21 +986,27 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         }
       }
 
-      await pgPool.query(
-        `UPDATE broadcasts SET status='completed' WHERE id=$1`,
-        [b.id]
+      // 3. Tandai broadcast sudah dijalankan
+      await client.query(
+        `UPDATE broadcasts
+            SET status = 'sent',
+                run_at = NOW()
+          WHERE id = $1`,
+        [bc.id]
       );
 
-      results.push({ broadcast_id: b.id, recipients: r.rows.length });
+      ran.push({
+        broadcast_id: bc.id,
+        recipients: recs.length
+      });
     }
 
-    res.json({
-      status: "ok",
-      ran: results
-    });
-  } catch (err) {
-    console.error("Error run-scheduled:", err);
-    res.status(500).json({ status: "error", error: String(err) });
+    return res.json({ status: "ok", ran });
+  } catch (e) {
+    console.error("Error /broadcast/run-scheduled:", e);
+    return res.status(500).json({ status: "error", error: String(e) });
+  } finally {
+    client.release();
   }
 });
 
