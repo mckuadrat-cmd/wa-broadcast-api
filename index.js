@@ -8,6 +8,14 @@ const axios = require("axios");
 
 const app = express();
 
+process.on("uncaughtException", (err) => {
+  console.error("🔥 UNCAUGHT ERROR:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("🔥 UNHANDLED PROMISE:", err);
+});
+
 const { Pool } = require("pg");
 
 // Pool Postgres (Railway)
