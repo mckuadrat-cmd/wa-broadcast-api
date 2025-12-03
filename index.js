@@ -663,26 +663,52 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 // =======================================================
 // 7) POST /kirimpesan/custom
 //    Kirim pesan bebas (text + optional media)
+//    + SEKARANG: log ke inbox_messages sebagai outgoing
 // =======================================================
 app.post("/kirimpesan/custom", async (req, res) => {
   try {
     const { to, text, media, phone_number_id } = req.body || {};
 
     if (!to) {
-      return res.status(400).json({ status: "error", error: "`to` (nomor tujuan) wajib diisi" });
-    }
-    if (!text && !media) {
       return res
         .status(400)
-        .json({ status: "error", error: "Minimal text atau media harus diisi" });
+        .json({ status: "error", error: "`to` (nomor tujuan) wajib diisi" });
+    }
+    if (!text && !media) {
+      return res.status(400).json({
+        status: "error",
+        error: "Minimal text atau media harus diisi",
+      });
     }
 
-    const data = await sendCustomMessage({ to, text, media, phone_number_id });
+    // 1) Kirim ke WhatsApp API
+    const waRes = await sendCustomMessage({ to, text, media, phone_number_id });
 
+    // 2) Simpan ke tabel inbox_messages sebagai pesan OUTGOING
+    //    (samakan nama kolom dengan yang di DB kamu)
+    try {
+      await pool.query(
+        `
+        INSERT INTO inbox_messages (at, phone, message_type, message_text, raw_json)
+        VALUES (NOW(), $1, $2, $3, $4)
+        `,
+        [
+          to,
+          media ? "outgoing_media" : "outgoing",       // ini yg nanti dipakai di frontend
+          text || null,
+          JSON.stringify(waRes || {}),
+        ]
+      );
+    } catch (dbErr) {
+      console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
+      // jangan throw, supaya user tetap dapet response "ok" kalau WA-nya sukses
+    }
+
+    // 3) Response ke frontend
     res.json({
       status: "ok",
       to,
-      wa_response: data,
+      wa_response: waRes,
     });
   } catch (err) {
     console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
