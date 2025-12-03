@@ -693,6 +693,25 @@ app.post("/kirimpesan/custom", async (req, res) => {
   }
 });
 
+// Helper umum untuk kirim payload WhatsApp mentah (dipakai di webhook follow-up)
+async function sendWhatsApp(payload) {
+  const phoneId = DEFAULT_PHONE_NUMBER_ID;
+  if (!phoneId) {
+    throw new Error("PHONE_NUMBER_ID belum diset");
+  }
+
+  const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
+
+  const resp = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${WA_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  return resp.data;
+}
+
 // =======================================================
 // 8) WEBHOOK WHATSAPP – FIXED VERSION
 // =======================================================
@@ -1100,6 +1119,160 @@ app.get("/kirimpesan/inbox", async (req, res) => {
   } catch (err) {
     console.error("Error /kirimpesan/inbox:", err);
     res.status(500).json({ status: "error", error: String(err) });
+  }
+});
+
+// =======================================================
+// 11) JALANKAN BROADCAST YANG DIJADWALKAN
+//     GET /kirimpesan/broadcast/run-scheduled
+//     (dipanggil tiap menit dari Apps Script)
+// =======================================================
+app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
+  try {
+    // 1. Ambil semua broadcast yang statusnya "scheduled" dan sudah jatuh tempo
+    const { rows: broadcasts } = await pgPool.query(
+      `SELECT *
+         FROM broadcasts
+        WHERE status = 'scheduled'
+          AND scheduled_at IS NOT NULL
+          AND scheduled_at <= NOW()`
+    );
+
+    if (!broadcasts.length) {
+      return res.json({
+        status: "ok",
+        ran: []
+      });
+    }
+
+    const ran = [];
+
+    for (const bc of broadcasts) {
+      // 2. Ambil semua penerima untuk broadcast ini
+      const { rows: recipients } = await pgPool.query(
+        `SELECT *
+           FROM broadcast_recipients
+          WHERE broadcast_id = $1`,
+        [bc.id]
+      );
+
+      if (!recipients.length) {
+        // kalau nggak ada penerima, tandai sent aja
+        await pgPool.query(
+          `UPDATE broadcasts
+              SET status = 'sent'
+            WHERE id = $1`,
+          [bc.id]
+        );
+        ran.push({ broadcast_id: bc.id, total: 0, ok: 0, failed: 0 });
+        continue;
+      }
+
+      // Ambil jumlah param template sekali saja per broadcast
+      const paramCount = await getTemplateParamCount(bc.template_name);
+      let okCount = 0;
+      let failCount = 0;
+
+      for (const rcp of recipients) {
+        const phone = rcp.phone;
+        if (!phone) continue;
+
+        const varsMap = rcp.vars_json || {};
+        const varKeys = Object.keys(varsMap)
+          .filter((k) => /^var\d+$/.test(k))
+          .sort((a, b) => {
+            const na = parseInt(a.replace("var", ""), 10);
+            const nb = parseInt(b.replace("var", ""), 10);
+            return na - nb;
+          });
+
+        const vars = varKeys.map((k) => varsMap[k]);
+        const varsForTemplate = vars.slice(0, paramCount);
+
+        // siapkan row untuk follow-up mapping (webhook)
+        const rowForMap = {
+          phone,
+          follow_media: rcp.follow_media || null,
+        };
+        varKeys.forEach((k) => {
+          rowForMap[k] = varsMap[k];
+        });
+        lastBroadcastRowsByPhone[String(phone)] = {
+          row: rowForMap,
+          broadcastId: bc.id,
+        };
+
+        try {
+          const r = await sendWaTemplate({
+            phone,
+            templateName: bc.template_name,
+            vars: varsForTemplate,
+            phone_number_id: bc.phone_number_id || undefined,
+          });
+
+          okCount++;
+
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+                SET template_ok = TRUE,
+                    template_http_status = $2,
+                    template_error = NULL
+              WHERE id = $1`,
+            [rcp.id, r.status || null]
+          );
+        } catch (err) {
+          failCount++;
+          const errorPayload = err.response?.data || err.message;
+
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+                SET template_ok = FALSE,
+                    template_http_status = $2,
+                    template_error = $3
+              WHERE id = $1`,
+            [
+              rcp.id,
+              err.response?.status || null,
+              typeof errorPayload === "string"
+                ? { message: errorPayload }
+                : errorPayload,
+            ]
+          );
+
+          console.error(
+            "Scheduled broadcast error for",
+            phone,
+            errorPayload
+          );
+        }
+      }
+
+      // 3. Tandai broadcast ini sudah dijalankan
+      await pgPool.query(
+        `UPDATE broadcasts
+            SET status = 'sent'
+          WHERE id = $1`,
+        [bc.id]
+      );
+
+      ran.push({
+        broadcast_id: bc.id,
+        total: recipients.length,
+        ok: okCount,
+        failed: failCount,
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      ran,
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
+    return res.status(500).json({
+      status: "error",
+      error: String(err),
+    });
   }
 });
 
