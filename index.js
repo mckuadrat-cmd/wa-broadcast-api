@@ -26,10 +26,15 @@ const pgPool = new Pool({
   }
 });
 
+const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
+
 // ====== CONFIG DARI ENV ======
 const WABA_ID    = process.env.WABA_ID;          // ID WhatsApp Business Account
 const WA_TOKEN   = process.env.WA_TOKEN;         // Permanent token
-const WA_VERSION = process.env.WA_VERSION || "v21.0";
+const WA_VERSION = process.env.WA_VERSION || "v24.0";
+
+// SATU SUMBER KEBENARAN
+const BUSINESS_ID = WABA_ID;
 
 // PHONE_NUMBER_ID default (kalau tidak dipilih dari dropdown di frontend)
 const DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
@@ -64,30 +69,26 @@ app.get("/", (req, res) => {
 async function getTemplateParamCount(templateName) {
   try {
     const resp = await axios.get(
-      `https://graph.facebook.com/v19.0/${process.env.WABA_BUSINESS_ID}/message_templates`,
+      `https://graph.facebook.com/${WA_VERSION}/${BUSINESS_ID}/message_templates`,
       {
-        params: {
-          name: templateName
-        },
+        params: { name: templateName },
         headers: {
-          Authorization: `Bearer ${process.env.WABA_TOKEN}`
+          Authorization: `Bearer ${WA_TOKEN}`
         }
       }
     );
 
     const t = resp.data?.data?.[0];
-    if (!t) return 1; // default 1 parameter
+    if (!t) return 1;
 
-    // cari body template
     const bodyComponent = t.components?.find(c => c.type === "BODY");
     if (!bodyComponent || !bodyComponent.text) return 0;
 
-    // hitung jumlah {{x}} dari body
     const matches = bodyComponent.text.match(/\{\{\d+\}\}/g);
     return matches ? matches.length : 0;
   } catch (err) {
     console.error("Gagal ambil template metadata:", err.response?.data || err);
-    return 1; // fallback
+    return 1;
   }
 }
 
@@ -242,8 +243,8 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
 
     const payload = {
       name,
-      category, // "UTILITY" / "MARKETING" / "AUTHENTICATION"
-      language: "en", // sementara pakai English (en)
+      category,
+      language: TEMPLATE_LANG,  // <– pakai env
       components,
     };
 
@@ -285,7 +286,7 @@ async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
     type: "template",
     template: {
       name: templateName,
-      language: { code: "en" }, // samakan dengan language template
+      language: { code: TEMPLATE_LANG }, // <–
       components: [
         {
           type: "body",
