@@ -26,28 +26,17 @@ const pgPool = new Pool({
   }
 });
 
-const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
-
 // ====== CONFIG DARI ENV ======
 const WABA_ID    = process.env.WABA_ID;          // ID WhatsApp Business Account
 const WA_TOKEN   = process.env.WA_TOKEN;         // Permanent token
 const WA_VERSION = process.env.WA_VERSION || "v24.0";
-
-// SATU SUMBER KEBENARAN
-const BUSINESS_ID = WABA_ID;
+const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
 
 // PHONE_NUMBER_ID default (kalau tidak dipilih dari dropdown di frontend)
 const DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 // Token verifikasi webhook (untuk Facebook Developer → Webhooks)
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "MCKUADRAT_WEBHOOK_TOKEN";
-
-// Optional: pesan & dokumen default untuk follow-up "Bersedia"
-const FOLLOWUP_MESSAGE_TEXT =
-  process.env.FOLLOWUP_MESSAGE_TEXT ||
-  "Terima kasih, Bapak/Ibu sudah bersedia. Informasi lebih lanjut akan kami sampaikan melalui pesan ini.";
-
-const FOLLOWUP_DOCUMENT_URL = process.env.FOLLOWUP_DOCUMENT_URL || "";
 
 // PORT Railway otomatis pakai process.env.PORT
 const PORT = process.env.PORT || 3000;
@@ -69,11 +58,10 @@ app.get("/", (req, res) => {
 async function getTemplateParamCount(templateName) {
   try {
     const resp = await axios.get(
-      `https://graph.facebook.com/${WA_VERSION}/${BUSINESS_ID}/message_templates`,
+      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`,
       {
         params: { name: templateName },
-        headers: {
-          Authorization: `Bearer ${WA_TOKEN}`
+        headers: { Authorization: `Bearer ${WA_TOKEN}` }
         }
       }
     );
