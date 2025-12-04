@@ -54,28 +54,41 @@ app.get("/", (req, res) => {
   res.send("MCKuadrat WA Broadcast API — ONLINE ✅");
 });
 
-async function getTemplateParamCount(templateName) {
+// Ambil metadata template: jumlah parameter & language
+async function getTemplateMetadata(templateName) {
   try {
     const resp = await axios.get(
       `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`,
       {
         params: { name: templateName },
         headers: { Authorization: `Bearer ${WA_TOKEN}` }
-        }
       }
     );
 
     const t = resp.data?.data?.[0];
-    if (!t) return 1;
+    if (!t) {
+      return {
+        paramCount: 1,
+        language: "en"   // default aman
+      };
+    }
 
     const bodyComponent = t.components?.find(c => c.type === "BODY");
-    if (!bodyComponent || !bodyComponent.text) return 0;
+    const text = bodyComponent?.text || "";
 
-    const matches = bodyComponent.text.match(/\{\{\d+\}\}/g);
-    return matches ? matches.length : 0;
+    const matches = text.match(/\{\{\d+\}\}/g);
+    const paramCount = matches ? matches.length : 0;
+
+    return {
+      paramCount,
+      language: t.language || "en"
+    };
   } catch (err) {
     console.error("Gagal ambil template metadata:", err.response?.data || err);
-    return 1;
+    return {
+      paramCount: 1,
+      language: "en"
+    };
   }
 }
 
@@ -259,7 +272,13 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
 // 4) Helper: kirim 1 WA template
 //    arg: { phone, templateName, vars, phone_number_id }
 // =======================================================
-async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
+async function sendWaTemplate({
+  phone,
+  templateName,
+  templateLanguage,
+  vars,
+  phone_number_id
+}) {
   const phoneId = phone_number_id || DEFAULT_PHONE_NUMBER_ID;
   if (!phoneId) {
     throw new Error("PHONE_NUMBER_ID belum diset");
@@ -267,13 +286,15 @@ async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
 
   const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
 
+  const langCode = templateLanguage || "en"; // fallback kalau metadata gagal
+
   const body = {
     messaging_product: "whatsapp",
     to: phone,
     type: "template",
     template: {
       name: templateName,
-      language: { code: TEMPLATE_LANG }, // <–
+      language: { code: langCode },
       components: [
         {
           type: "body",
@@ -285,6 +306,8 @@ async function sendWaTemplate({ phone, templateName, vars, phone_number_id }) {
       ],
     },
   };
+
+  console.log("DEBUG sendWaTemplate body:", JSON.stringify(body, null, 2));
 
   const resp = await axios.post(url, body, {
     headers: {
@@ -403,6 +426,18 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
     if (!Array.isArray(rows) || !rows.length) {
       return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
     }
+
+    console.log("📨 /kirimpesan/broadcast REQUEST:", {
+      template_name,
+      rows_count: rows.length,
+      sender_phone,
+      phone_number_id,
+      scheduled_at
+    });
+
+    // 🔍 Ambil metadata template SEKALI saja
+    const { paramCount, language } = await getTemplateMetadata(template_name);
+    console.log("Template metadata:", { paramCount, language });
 
     // --- cek apakah ini broadcast terjadwal? ---
     const JAKARTA_OFFSET_MIN = 7 * 60; // +07:00
@@ -560,11 +595,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           varsMap["var" + (idx + 1)] = v;
         });
       }
-
-      // ⚠️ PENTING:
-      // Template WA sekarang cuma punya {{1}},
-      // jadi ke Meta kita kirim HANYA parameter pertama.
-      const paramCount = await getTemplateParamCount(template_name);
+      
+      // Ambil hanya sebanyak param yang diminta template
       const varsForTemplate = vars.slice(0, paramCount);
 
       const followMedia = row.follow_media || null;
@@ -573,7 +605,8 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
-          vars: varsForTemplate,          // <= DI SINI pakai varsForTemplate
+          templateLanguage: language,   // <– otomatis ikut template
+          vars: varsForTemplate,
           phone_number_id: effectivePhoneId
         });
 
@@ -1203,8 +1236,8 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         continue;
       }
 
-      // Ambil jumlah param template sekali saja per broadcast
-      const paramCount = await getTemplateParamCount(bc.template_name);
+      // Ambil metadata template sekali saja per broadcast
+      const { paramCount, language } = await getTemplateMetadata(bc.template_name);
       let okCount = 0;
       let failCount = 0;
 
@@ -1241,6 +1274,7 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           const r = await sendWaTemplate({
             phone,
             templateName: bc.template_name,
+            templateLanguage: language,
             vars: varsForTemplate,
             phone_number_id: bc.phone_number_id || undefined,
           });
