@@ -536,17 +536,19 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
           });
 
         const followMedia = row.follow_media || null;
-
+        const followMediaFilename = row.follow_media_filename || null;
+        
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
+             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, NULL, NULL, NULL, NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NULL, NULL, NULL, NOW())`,
           [
             broadcastId,                                   // $1
             phone,                                         // $2
             Object.keys(varsMap).length ? varsMap : null, // $3
-            followMedia                                    // $4
+            followMedia,                                   // $4
+            followMediaFilename                            // $5
           ]
         );
       }
@@ -600,6 +602,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
       const varsForTemplate = vars.slice(0, paramCount);
 
       const followMedia = row.follow_media || null;
+      const followMediaFilename = row.follow_media_filename || null;
 
       try {
         const r = await sendWaTemplate({
@@ -614,17 +617,18 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
+             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
           [
             broadcastId,                                      // $1
             phone,                                            // $2
             Object.keys(varsMap).length ? varsMap : null,     // $3
             followMedia,                                      // $4
-            true,                                             // $5
-            r.status || null,                                 // $6
-            null                                              // $7
+            followMediaFilename,                              // $5
+            true,                                             // $6
+            r.status || null,                                 // $7
+            null                                              // $8
           ]
         );
       } catch (err) {
@@ -642,7 +646,7 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
 
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media,
+             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              template_ok, template_http_status, template_error, created_at
            ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW())`,
           [
@@ -650,11 +654,12 @@ app.post("/kirimpesan/broadcast", async (req, res) => {
             phone,                                            // $2
             Object.keys(varsMap).length ? varsMap : null,     // $3
             followMedia,                                      // $4
-            false,                                            // $5
-            err.response?.status || null,                     // $6
+            followMediaFilename,                              // $5
+            false,                                            // $6
+            err.response?.status || null,                     // $7
             typeof errorPayload === "string"
               ? { message: errorPayload }
-              : errorPayload                                  // $7
+              : errorPayload                                  // $8
           ]
         );
       }
@@ -759,12 +764,26 @@ function applyFollowupTemplate(text, row) {
 
 // Bangun nama file dari template (mis: "Surat penerimaan {{1}}")
 function buildFilenameFromTemplate(filenameTpl, row) {
-  if (!filenameTpl) return "document.pdf";
-  let name = applyFollowupTemplate(filenameTpl, row).trim();
-  if (!name.toLowerCase().endsWith(".pdf")) {
-    name += ".pdf";
+  // 1) Kalau per nomor sudah ada follow_media_filename, pakai itu
+  if (row && row.follow_media_filename) {
+    let name = String(row.follow_media_filename).trim();
+    if (!name.toLowerCase().endsWith(".pdf")) {
+      name += ".pdf";
+    }
+    return name;
   }
-  return name;
+
+  // 2) Kalau ada template filename (static_media.filename), pakai itu + {{var}} replacement
+  if (filenameTpl) {
+    let name = applyFollowupTemplate(filenameTpl, row).trim();
+    if (!name.toLowerCase().endsWith(".pdf")) {
+      name += ".pdf";
+    }
+    return name;
+  }
+
+  // 3) Fallback
+  return "Lampiran";
 }
 
 // ========== VERIFIKASI WEBHOOK (saat set di Facebook Developer) ==========
@@ -1084,6 +1103,7 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", async (req, res) => {
     }
     headers.push(
       "follow_media",
+      "follow_media_filename",
       "template_ok",
       "template_http_status",
       "template_error",
@@ -1113,7 +1133,9 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", async (req, res) => {
       }
 
       const followMedia = row.follow_media || "";
+      const followMediaFilename = row.follow_media_filename || "";
       cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
+      cols.push(`"${String(followMediaFilename).replace(/"/g, '""')}"`);
 
       cols.push(row.template_ok ? "1" : "0");
       cols.push(row.template_http_status != null ? String(row.template_http_status) : "");
@@ -1261,6 +1283,7 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         const rowForMap = {
           phone,
           follow_media: rcp.follow_media || null,
+          follow_media_filename: rcp.follow_media_filename || null,
         };
         varKeys.forEach((k) => {
           rowForMap[k] = varsMap[k];
