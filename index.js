@@ -150,11 +150,14 @@ app.get("/kirimpesan/templates", async (req, res) => {
       return res.status(500).json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
     }
 
-    const status = req.query.status || "APPROVED";
-
-    const url =
-      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates` +
-      `?status=${encodeURIComponent(status)}`;
+    let status = (req.query.status || "").toUpperCase();
+    
+    let url =
+      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
+    
+    if (status && status !== "ALL") {
+      url += `?status=${encodeURIComponent(status)}`;
+    }
 
     const resp = await axios.get(url, {
       headers: { Authorization: `Bearer ${WA_TOKEN}` },
