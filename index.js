@@ -786,6 +786,36 @@ function buildFilenameFromTemplate(filenameTpl, row) {
   return "Lampiran";
 }
 
+// Ambil info media dari 1 pesan WA (image / document / video / audio)
+function extractMediaInfoFromMessage(msg) {
+  let mediaType = null;
+  let mediaId = null;
+  let mediaFilename = null;
+  let mediaCaption = null;
+
+  if (!msg || !msg.type) return { mediaType, mediaId, mediaFilename, mediaCaption };
+
+  if (msg.type === "image" && msg.image) {
+    mediaType = "image";
+    mediaId = msg.image.id || null;
+    mediaCaption = msg.image.caption || null;
+  } else if (msg.type === "video" && msg.video) {
+    mediaType = "video";
+    mediaId = msg.video.id || null;
+    mediaCaption = msg.video.caption || null;
+  } else if (msg.type === "audio" && msg.audio) {
+    mediaType = "audio";
+    mediaId = msg.audio.id || null;
+  } else if (msg.type === "document" && msg.document) {
+    mediaType = "document";
+    mediaId = msg.document.id || null;
+    mediaFilename = msg.document.filename || null;
+    mediaCaption = msg.document.caption || null;
+  }
+
+  return { mediaType, mediaId, mediaFilename, mediaCaption };
+}
+
 // ========== VERIFIKASI WEBHOOK (saat set di Facebook Developer) ==========
 app.get("/kirimpesan/webhook", (req, res) => {
   const mode      = req.query["hub.mode"];
@@ -836,6 +866,14 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       }
     }
 
+    // Ambil info media (kalau pesan image/video/audio/document)
+    const {
+      mediaType,
+      mediaId,
+      mediaFilename,
+      mediaCaption,
+    } = extractMediaInfoFromMessage(msg);
+
     console.log("Type:", msg.type, "from:", from, "text:", triggerText);
 
     // ====== MAP KE ROW BROADCAST TERAKHIR ======
@@ -845,26 +883,39 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const broadcastId = mapEntry ? mapEntry.broadcastId : null;
 
     // ====== SIMPAN KE inbox_messages SELALU ======
-    try {
-      const isQuickReply =
-        !!triggerText && (msg.type === "button" || msg.type === "interactive");
-
-      await pgPool.query(
-        `INSERT INTO inbox_messages
-           (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [
-          from,
-          msg.type || null,
-          triggerText || null,
-          req.body || null,
-          broadcastId || null,
-          isQuickReply
-        ]
-      );
-    } catch (e) {
-      console.error("Insert inbox_messages error:", e);
-    }
+      try {
+        const isQuickReply =
+          !!triggerText && (msg.type === "button" || msg.type === "interactive");
+  
+        await pgPool.query(
+          `INSERT INTO inbox_messages
+             (phone,
+              message_type,
+              message_text,
+              raw_json,
+              broadcast_id,
+              is_quick_reply,
+              media_type,
+              media_id,
+              media_filename,
+              media_caption)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [
+            from,
+            msg.type || null,
+            triggerText || null,
+            JSON.stringify(req.body || {}),
+            broadcastId || null,
+            isQuickReply,
+            mediaType,
+            mediaId,
+            mediaFilename,
+            mediaCaption
+          ]
+        );
+      } catch (e) {
+        console.error("Insert inbox_messages error:", e);
+      }
 
     // ====== KALAU BUKAN "BERSEDIA" → TIDAK BALAS APA-APA ======
     if (!triggerText || !triggerText.toUpperCase().includes("BERSEDIA")) {
@@ -1187,6 +1238,10 @@ app.get("/kirimpesan/inbox", async (req, res) => {
         im.message_text,
         im.is_quick_reply,
         im.broadcast_id,
+        im.media_type,
+        im.media_id,
+        im.media_filename,
+        im.media_caption,
         b.template_name,
         br.vars_json
       FROM inbox_messages im
@@ -1365,6 +1420,49 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       status: "error",
       error: String(err),
     });
+  }
+});
+
+// =======================================================
+//  X) PROXY MEDIA WHATSAPP
+//     GET /kirimpesan/media/:id
+//     Frontend pakai ini sebagai src gambar/video/audio
+// =======================================================
+app.get("/kirimpesan/media/:id", async (req, res) => {
+  try {
+    const mediaId = req.params.id;
+
+    if (!mediaId) {
+      return res.status(400).send("media id required");
+    }
+    if (!WA_TOKEN) {
+      return res.status(500).send("WA_TOKEN belum diset");
+    }
+
+    // 1) Ambil metadata media (url + mime_type)
+    const metaUrl = `https://graph.facebook.com/${WA_VERSION}/${mediaId}`;
+    const metaResp = await axios.get(metaUrl, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+    });
+
+    const fileUrl = metaResp.data?.url;
+    const mime = metaResp.data?.mime_type || "application/octet-stream";
+
+    if (!fileUrl) {
+      return res.status(404).send("Media URL not found");
+    }
+
+    // 2) Ambil file sebenarnya dan stream ke client
+    const fileResp = await axios.get(fileUrl, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      responseType: "stream",
+    });
+
+    res.setHeader("Content-Type", mime);
+    fileResp.data.pipe(res);
+  } catch (err) {
+    console.error("Error proxy media:", err.response?.data || err.message);
+    res.status(500).send("Error fetching media");
   }
 });
 
