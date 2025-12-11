@@ -263,10 +263,27 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
       meta_response: resp.data,
     });
   } catch (err) {
-    console.error("Error /kirimpesan/templates/create:", err.response?.data || err.message);
-    res.status(500).json({
+    const meta = err.response?.data;
+    console.error(
+      "Error /kirimpesan/templates/create:",
+      meta || err.message
+    );
+
+    // Ambil pesan paling enak dibaca dari Meta
+    let message = err.message || "Gagal membuat template";
+
+    if (meta?.error?.error_user_msg) {
+      // biasanya ini yang muncul di UI WhatsApp Manager
+      message = meta.error.error_user_msg;
+    } else if (meta?.error?.message) {
+      // fallback: pesan umum Graph API
+      message = meta.error.message;
+    }
+
+    res.status(err.response?.status || 500).json({
       status: "error",
-      error: err.response?.data || err.message,
+      error_message: message,        // ← dipakai frontend
+      error_raw: meta || err.message // ← buat debug/log saja
     });
   }
 });
