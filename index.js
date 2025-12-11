@@ -202,6 +202,7 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
       example_1,
       footer_text,
       buttons,
+      media_sample,
     } = req.body || {};
 
     if (!name || !category || !body_text) {
@@ -227,22 +228,40 @@ app.post("/kirimpesan/templates/create", async (req, res) => {
       },
     ];
 
-    if (footer_text) {
+      // HEADER media (optional)
+      if (media_sample && media_sample !== "NONE") {
+        components.push({
+          type: "HEADER",
+          format: media_sample, // "IMAGE" | "VIDEO" | "DOCUMENT" | "LOCATION"
+          // contoh paling simpel, tanpa variable & tanpa sample handle dulu
+        });
+      }
+      
+      // BODY
       components.push({
-        type: "FOOTER",
-        text: footer_text,
+        type: "BODY",
+        text: body_text,
+        // kalau mau pakai example_1 → masukkan ke "example"
       });
-    }
-
-    if (Array.isArray(buttons) && buttons.length) {
-      components.push({
-        type: "BUTTONS",
-        buttons: buttons.slice(0, 3).map((label) => ({
-          type: "QUICK_REPLY",
-          text: label,
-        })),
-      });
-    }
+      
+      // FOOTER (opsional)
+      if (footer_text) {
+        components.push({
+          type: "FOOTER",
+          text: footer_text,
+        });
+      }
+      
+      // BUTTONS (kalau ada)
+      if (Array.isArray(buttons) && buttons.length) {
+        components.push({
+          type: "BUTTONS",
+          buttons: buttons.map((label) => ({
+            type: "QUICK_REPLY",
+            text: label,
+          })),
+        });
+      }
 
     const payload = {
       name,
