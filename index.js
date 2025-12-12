@@ -1,4 +1,4 @@
-// index.js
+// index.js 
 // MCKuadrat WA Broadcast API (CommonJS)
 require("dotenv").config();
 const express = require("express");
