@@ -1,5 +1,12 @@
-// index.js 
-// MCKuadrat WA Broadcast API (CommonJS)
+// index.js
+// MCKuadrat WA Broadcast API (CommonJS) — multi-school (config di DB)
+// NOTE:
+// - schools menyimpan waba_id, wa_token, wa_version, template_lang, default_phone_number_id
+// - users punya phone_number_id (optional override)
+//
+// SECURITY NOTE:
+// Jangan simpan token “permanent” di chat / repo publik. Anggap token yang sudah terlanjur terkirim itu compromised dan ROTATE.
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -10,7 +17,6 @@ const FormData = require("form-data");
 
 const app = express();
 
-const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET || "GANTI_SECRET_INI_DI_ENV";
@@ -29,27 +35,22 @@ const { Pool } = require("pg");
 // Pool Postgres (Railway)
 const pgPool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
-// ====== CONFIG DARI ENV ======
-const WABA_ID = process.env.WABA_ID; // ID WhatsApp Business Account
-const WA_TOKEN = process.env.WA_TOKEN; // Permanent token
-const WA_VERSION = process.env.WA_VERSION || "v24.0";
-const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
+// ====== FALLBACK CONFIG DARI ENV (DEV / SINGLE-SCHOOL ONLY) ======
+// (di mode multi-school: semua config WA diambil dari DB via user.school_id)
+const ENV_WABA_ID = process.env.WABA_ID || null;
+const ENV_WA_TOKEN = process.env.WA_TOKEN || null;
+const ENV_WA_VERSION = process.env.WA_VERSION || "v24.0";
+const ENV_TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
+const ENV_DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || null;
 
 // Upload file ke memory (bukan ke disk)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 15 * 1024 * 1024, // max 15 MB
-  },
+  limits: { fileSize: 15 * 1024 * 1024 }, // max 15 MB
 });
-
-// PHONE_NUMBER_ID default (kalau tidak dipilih dari dropdown di frontend)
-const DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 // Token verifikasi webhook (untuk Facebook Developer → Webhooks)
 const WEBHOOK_VERIFY_TOKEN =
@@ -71,12 +72,14 @@ app.use(express.json());
 // AUTH HELPER & MIDDLEWARE
 // =====================================================
 function signJwt(user) {
+  // user minimal: id, role, school_id, school_key, display_name_user
   return jwt.sign(
     {
       sub: user.id,
       school_id: user.school_id,
+      school_key: user.school_key,
       role: user.role,
-      name: user.display_name,
+      name: user.display_name_user || user.username || "User",
     },
     JWT_SECRET,
     { expiresIn: "7d" }
@@ -105,7 +108,71 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// ====== ROOT SIMPLE CEK ONLINE ======
+// =====================================================
+// HELPER: Ambil WA config dari DB berdasarkan userId
+// =====================================================
+// Return:
+// {
+//   user_id, username, display_name_user, role, school_id,
+//   school_key, school_name, alamat,
+//   waba_id, wa_token, wa_version, template_lang,
+//   phone_number_id (effective: COALESCE(user.phone_number_id, school.default_phone_number_id))
+// }
+async function getCtxByUserId(userId) {
+  const { rows } = await pgPool.query(
+    `
+    SELECT
+      u.id as user_id,
+      u.username,
+      u.display_name_user,
+      u.role,
+      u.school_id,
+      COALESCE(u.phone_number_id, s.default_phone_number_id) AS phone_number_id,
+
+      s.school_key,
+      s.display_name AS school_name,
+      s.alamat,
+      s.waba_id,
+      s.wa_token,
+      s.wa_version,
+      s.template_lang,
+      s.default_phone_number_id
+    FROM users u
+    JOIN schools s ON s.id = u.school_id
+    WHERE u.id = $1
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  if (rows.length) return rows[0];
+
+  // fallback (DEV ONLY)
+  if (ENV_WABA_ID && ENV_WA_TOKEN) {
+    return {
+      user_id: userId,
+      username: null,
+      display_name_user: null,
+      role: "admin",
+      school_id: null,
+      phone_number_id: ENV_DEFAULT_PHONE_NUMBER_ID,
+      school_key: null,
+      school_name: null,
+      alamat: null,
+      waba_id: ENV_WABA_ID,
+      wa_token: ENV_WA_TOKEN,
+      wa_version: ENV_WA_VERSION,
+      template_lang: ENV_TEMPLATE_LANG,
+      default_phone_number_id: ENV_DEFAULT_PHONE_NUMBER_ID,
+    };
+  }
+
+  throw new Error("School config tidak ditemukan untuk user ini (dan ENV fallback tidak tersedia)");
+}
+
+// =======================================================
+// ROOT SIMPLE CEK ONLINE
+// =======================================================
 app.get("/", (req, res) => {
   res.send("MCKuadrat WA Broadcast API — ONLINE ✅");
 });
@@ -128,11 +195,27 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
 
     const uname = String(username).trim().toLowerCase();
 
+    // NOTE:
+    // Karena lu seed pakai pgcrypto crypt('pw', gen_salt('bf')),
+    // kita verifikasi password via SQL: password_hash = crypt(input, password_hash)
     const { rows } = await pgPool.query(
-      `SELECT id, username, password_hash, school_id, display_name, alamat, role
-       FROM users
-       WHERE username = $1`,
-      [uname]
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.display_name_user,
+        u.role,
+        u.school_id,
+        s.school_key,
+        s.display_name AS school_name,
+        s.alamat
+      FROM users u
+      JOIN schools s ON s.id = u.school_id
+      WHERE u.username = $1
+        AND u.password_hash = crypt($2, u.password_hash)
+      LIMIT 1
+      `,
+      [uname, password]
     );
 
     if (!rows.length) {
@@ -142,13 +225,6 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
     }
 
     const user = rows[0];
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) {
-      return res
-        .status(401)
-        .json({ status: "error", error: "Username atau password salah" });
-    }
-
     const token = signJwt(user);
 
     return res.json({
@@ -158,8 +234,10 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
         id: user.id,
         username: user.username,
         schoolId: user.school_id,
-        displayName: user.display_name,
+        schoolKey: user.school_key,
+        schoolName: user.school_name,
         alamat: user.alamat,
+        displayName: user.display_name_user,
         role: user.role,
       },
     });
@@ -171,23 +249,22 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
   }
 });
 
-// Ambil metadata template: jumlah parameter & language
-async function getTemplateMetadata(templateName) {
+// =======================================================
+// Helper: ambil metadata template (paramCount & language)
+// =======================================================
+async function getTemplateMetadata(ctx, templateName) {
   try {
     const resp = await axios.get(
-      `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`,
+      `https://graph.facebook.com/${ctx.wa_version}/${ctx.waba_id}/message_templates`,
       {
         params: { name: templateName },
-        headers: { Authorization: `Bearer ${WA_TOKEN}` },
+        headers: { Authorization: `Bearer ${ctx.wa_token}` },
       }
     );
 
     const t = resp.data?.data?.[0];
     if (!t) {
-      return {
-        paramCount: 1,
-        language: "en", // default aman
-      };
+      return { paramCount: 1, language: ctx.template_lang || "en" };
     }
 
     const bodyComponent = t.components?.find((c) => c.type === "BODY");
@@ -198,34 +275,28 @@ async function getTemplateMetadata(templateName) {
 
     return {
       paramCount,
-      language: t.language || "en",
+      language: t.language || ctx.template_lang || "en",
     };
   } catch (err) {
-    console.error(
-      "Gagal ambil template metadata:",
-      err.response?.data || err
-    );
-    return {
-      paramCount: 1,
-      language: "en",
-    };
+    console.error("Gagal ambil template metadata:", err.response?.data || err);
+    return { paramCount: 1, language: ctx.template_lang || "en" };
   }
 }
 
 // =======================================================
 // HELPER: Ambil daftar phone_numbers dari WABA
 // =======================================================
-async function getWabaPhoneNumbers() {
-  if (!WABA_ID || !WA_TOKEN) {
-    throw new Error("WABA_ID atau WA_TOKEN belum diset di server");
+async function getWabaPhoneNumbers(ctx) {
+  if (!ctx?.waba_id || !ctx?.wa_token) {
+    throw new Error("WABA config belum tersedia (waba_id / wa_token)");
   }
 
   const url =
-    `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/phone_numbers` +
+    `https://graph.facebook.com/${ctx.wa_version}/${ctx.waba_id}/phone_numbers` +
     `?fields=id,display_phone_number,verified_name`;
 
   const resp = await axios.get(url, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+    headers: { Authorization: `Bearer ${ctx.wa_token}` },
   });
 
   return Array.isArray(resp.data?.data) ? resp.data.data : [];
@@ -233,64 +304,47 @@ async function getWabaPhoneNumbers() {
 
 // =======================================================
 // 1) GET /kirimpesan/senders
-//    Ambil daftar phone_number dari WABA (untuk dropdown Sender Number)
 // =======================================================
 app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
   try {
-    const rows = await getWabaPhoneNumbers();
+    const ctx = await getCtxByUserId(req.user.sub);
+
+    const rows = await getWabaPhoneNumbers(ctx);
 
     const senders = rows.map((r) => ({
       phone_number_id: r.id,
       phone: r.display_phone_number,
-      label: `${r.display_phone_number} - ${
-        r.verified_name || r.display_phone_number
-      }`,
+      label: `${r.display_phone_number} - ${r.verified_name || r.display_phone_number}`,
       name: r.verified_name || r.display_phone_number,
+      is_default: String(r.id) === String(ctx.default_phone_number_id || ""),
     }));
 
-    res.json({
-      status: "ok",
-      count: senders.length,
-      senders,
-    });
+    res.json({ status: "ok", count: senders.length, senders });
   } catch (err) {
-    console.error(
-      "Error /kirimpesan/senders:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({
-      status: "error",
-      error: err.response?.data || err.message,
-    });
+    console.error("Error /kirimpesan/senders:", err.response?.data || err.message);
+    res.status(500).json({ status: "error", error: err.response?.data || err.message });
   }
 });
 
 // =======================================================
 // 2) GET /kirimpesan/templates
-//    Ambil daftar template dari Meta, filter status (default APPROVED)
 // =======================================================
 app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
   try {
-    if (!WABA_ID || !WA_TOKEN) {
-      return res
-        .status(500)
-        .json({ error: "WABA_ID atau WA_TOKEN belum diset di server" });
-    }
+    const ctx = await getCtxByUserId(req.user.sub);
 
     let status = (req.query.status || "").toUpperCase();
-
-    let url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
+    let url = `https://graph.facebook.com/${ctx.wa_version}/${ctx.waba_id}/message_templates`;
 
     if (status && status !== "ALL") {
       url += `?status=${encodeURIComponent(status)}`;
     }
 
     const resp = await axios.get(url, {
-      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      headers: { Authorization: `Bearer ${ctx.wa_token}` },
     });
 
     const templates = Array.isArray(resp.data?.data) ? resp.data.data : [];
-
     const simplified = templates.map((t) => ({
       id: t.id,
       name: t.name,
@@ -300,20 +354,10 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
       components: t.components,
     }));
 
-    res.json({
-      status: "ok",
-      count: simplified.length,
-      templates: simplified,
-    });
+    res.json({ status: "ok", count: simplified.length, templates: simplified });
   } catch (err) {
-    console.error(
-      "Error /kirimpesan/templates:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({
-      status: "error",
-      error: err.response?.data || err.message,
-    });
+    console.error("Error /kirimpesan/templates:", err.response?.data || err.message);
+    res.status(500).json({ status: "error", error: err.response?.data || err.message });
   }
 });
 
@@ -329,44 +373,29 @@ app.post(
   upload.single("file"),
   async (req, res) => {
     try {
+      const ctx = await getCtxByUserId(req.user.sub);
+
       if (!META_APP_ID) {
-        return res.status(500).json({
-          status: "error",
-          error: "META_APP_ID belum diset di server",
-        });
+        return res.status(500).json({ status: "error", error: "META_APP_ID belum diset di server" });
       }
-      if (!WA_TOKEN) {
-        return res.status(500).json({
-          status: "error",
-          error: "WA_TOKEN belum diset di server",
-        });
+      if (!ctx.wa_token) {
+        return res.status(500).json({ status: "error", error: "WA token sekolah belum diset" });
       }
       if (!req.file) {
-        return res.status(400).json({
-          status: "error",
-          error: "file wajib diupload",
-        });
+        return res.status(400).json({ status: "error", error: "file wajib diupload" });
       }
 
       const mimeType = req.file.mimetype || "application/pdf";
       const fileName = req.file.originalname || "sample";
       const fileLength = req.file.size;
 
-      // 1) Create upload session (Resumable Upload API)
-      const createSessionUrl = `https://graph.facebook.com/${WA_VERSION}/${META_APP_ID}/uploads`;
+      // 1) Create upload session
+      const createSessionUrl = `https://graph.facebook.com/${ctx.wa_version}/${META_APP_ID}/uploads`;
 
-      const sessResp = await axios.post(
-        createSessionUrl,
-        null,
-        {
-          params: {
-            file_name: fileName,
-            file_length: fileLength,
-            file_type: mimeType,
-          },
-          headers: { Authorization: `Bearer ${WA_TOKEN}` },
-        }
-      );
+      const sessResp = await axios.post(createSessionUrl, null, {
+        params: { file_name: fileName, file_length: fileLength, file_type: mimeType },
+        headers: { Authorization: `Bearer ${ctx.wa_token}` },
+      });
 
       const uploadSessionId = sessResp.data?.id;
       if (!uploadSessionId) {
@@ -377,19 +406,19 @@ app.post(
         });
       }
 
-      // 2) Upload bytes ke session id → dapat "h" (handle)
-      const uploadUrl = `https://graph.facebook.com/${WA_VERSION}/${uploadSessionId}`;
+      // 2) Upload bytes
+      const uploadUrl = `https://graph.facebook.com/${ctx.wa_version}/${uploadSessionId}`;
 
       const upResp = await axios.post(uploadUrl, req.file.buffer, {
         headers: {
-          Authorization: `Bearer ${WA_TOKEN}`,
+          Authorization: `Bearer ${ctx.wa_token}`,
           "Content-Type": mimeType,
-          "file_offset": "0",
+          file_offset: "0",
         },
         maxBodyLength: Infinity,
       });
 
-      const handle = upResp.data?.h; // <-- INI yang dipakai jadi header_handle
+      const handle = upResp.data?.h;
       if (!handle) {
         return res.status(500).json({
           status: "error",
@@ -398,14 +427,14 @@ app.post(
         });
       }
 
-    return res.json({
-      status: "ok",
-      handle,
-      media_id: handle, // alias biar FE lama gak rusak
-      mime_type: mimeType,
-      filename: fileName,
-      size: fileLength,
-    });
+      return res.json({
+        status: "ok",
+        handle,
+        media_id: handle, // alias biar FE lama gak rusak
+        mime_type: mimeType,
+        filename: fileName,
+        size: fileLength,
+      });
     } catch (err) {
       const meta = err.response?.data;
       console.error("Error upload-sample(handle):", meta || err.message);
@@ -421,109 +450,86 @@ app.post(
 
 // =======================================================
 // 3) POST /kirimpesan/templates/create
-//    Ajukan template baru ke Meta
-//    Body JSON: { name, category, body_text, example_1, footer_text, buttons, media_sample, sample_media_id }
 // =======================================================
 app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   try {
-  const {
-    name,
-    category,
-    body_text,
-    example_1,
-    footer_text,
-    buttons,
-    media_sample,      // "DOCUMENT" | "IMAGE" | "VIDEO" | "NONE"
-    media_handle_id,   // hasil dari upload-sample (media_id)
-    sample_media_id,
-  } = req.body || {};
-    
-  const handleId = media_handle_id || sample_media_id;
-  
-  const components = [];
+    const ctx = await getCtxByUserId(req.user.sub);
 
-  // ===============================
-  // HEADER (MEDIA SAMPLE OPSIONAL)
-  // ===============================
-  if (media_sample && media_sample !== "NONE") {
-    if (!handleId) {
-      return res.status(400).json({
-        status: "error",
-        error: "media_handle_id / sample_media_id wajib diisi jika media_sample bukan NONE",
+    const {
+      name,
+      category,
+      body_text,
+      example_1,
+      footer_text,
+      buttons,
+      media_sample, // "DOCUMENT" | "IMAGE" | "VIDEO" | "NONE"
+      media_handle_id,
+      sample_media_id,
+    } = req.body || {};
+
+    const handleId = media_handle_id || sample_media_id;
+
+    const components = [];
+
+    // HEADER (MEDIA SAMPLE OPSIONAL)
+    if (media_sample && media_sample !== "NONE") {
+      if (!handleId) {
+        return res.status(400).json({
+          status: "error",
+          error: "media_handle_id / sample_media_id wajib diisi jika media_sample bukan NONE",
+        });
+      }
+
+      components.push({
+        type: "HEADER",
+        format: media_sample,
+        example: { header_handle: [handleId] },
       });
     }
-  
-    components.push({
-      type: "HEADER",
-      format: media_sample, // DOCUMENT | IMAGE | VIDEO
-      example: { header_handle: [handleId] },
-    });
-  }
-  
-    // ===============================
+
     // BODY (WAJIB)
-    // ===============================
     components.push({
       type: "BODY",
       text: body_text,
       ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
     });
-    
-    // ===============================
+
     // FOOTER (OPSIONAL)
-    // ===============================
     if (footer_text) {
+      components.push({ type: "FOOTER", text: footer_text });
+    }
+
+    // BUTTONS (OPSIONAL)
+    if (Array.isArray(buttons) && buttons.length) {
       components.push({
-        type: "FOOTER",
-        text: footer_text,
+        type: "BUTTONS",
+        buttons: buttons.map((label) => ({ type: "QUICK_REPLY", text: label })),
       });
     }
-  
-  // ===============================
-  // BUTTONS (OPSIONAL)
-  // ===============================
-  if (Array.isArray(buttons) && buttons.length) {
-    components.push({
-      type: "BUTTONS",
-      buttons: buttons.map((label) => ({
-        type: "QUICK_REPLY",
-        text: label,
-      })),
-    });
-  }
-  
-  const payload = {
-    name,
-    category,
-    language: TEMPLATE_LANG,
-    components,
-  };
-    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
+
+    const payload = {
+      name,
+      category,
+      language: ctx.template_lang || "en",
+      components,
+    };
+
+    const url = `https://graph.facebook.com/${ctx.wa_version}/${ctx.waba_id}/message_templates`;
     const resp = await axios.post(url, payload, {
       headers: {
-        Authorization: `Bearer ${WA_TOKEN}`,
+        Authorization: `Bearer ${ctx.wa_token}`,
         "Content-Type": "application/json",
       },
     });
 
-    res.json({
-      status: "submitted",
-      meta_response: resp.data,
-    });
+    res.json({ status: "submitted", meta_response: resp.data });
   } catch (err) {
     const meta = err.response?.data;
-    console.error(
-      "Error /kirimpesan/templates/create:",
-      meta || err.message
-    );
+    console.error("Error /kirimpesan/templates/create:", meta || err.message);
 
     let message = err.message || "Gagal membuat template";
-
-    if (meta?.error?.error_user_msg) {
-      message = meta.error.error_user_msg;
-    } else if (meta?.error?.message) {
-      message = meta.error.message;
-    }
+    if (meta?.error?.error_user_msg) message = meta.error.error_user_msg;
+    else if (meta?.error?.message) message = meta.error.message;
 
     res.status(err.response?.status || 500).json({
       status: "error",
@@ -535,51 +541,34 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
 
 // =======================================================
 // 4) Helper: kirim 1 WA template
-//    arg: { phone, templateName, templateLanguage, vars, phone_number_id, headerDocument }
 // =======================================================
-async function sendWaTemplate({
-  phone,
-  templateName,
-  templateLanguage,
-  vars,
-  phone_number_id,
-  headerDocument,   // 👈 tambahan: boleh null
-}) {
-  const phoneId = phone_number_id || DEFAULT_PHONE_NUMBER_ID;
-  if (!phoneId) {
-    throw new Error("PHONE_NUMBER_ID belum diset");
-  }
+async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars, phone_number_id, headerDocument }) {
+  const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
+  if (!phoneId) throw new Error("PHONE_NUMBER_ID belum tersedia (user/school/default)");
 
-  const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
+  const url = `https://graph.facebook.com/${ctx.wa_version}/${phoneId}/messages`;
+  const langCode = templateLanguage || ctx.template_lang || "en";
 
-  const langCode = templateLanguage || "en"; // fallback kalau metadata gagal
-
-  // --- susun components dinamis: HEADER (opsional) + BODY ---
   const components = [];
 
-  // 1) HEADER document (kalau ada follow_media)
+  // HEADER document (opsional)
   if (headerDocument && headerDocument.link) {
     let filename = (headerDocument.filename || "").trim();
     if (!filename) filename = "document.pdf";
-    if (!filename.toLowerCase().endsWith(".pdf")) {
-      filename += ".pdf";
-    }
+    if (!filename.toLowerCase().endsWith(".pdf")) filename += ".pdf";
 
     components.push({
       type: "header",
       parameters: [
         {
           type: "document",
-          document: {
-            link: headerDocument.link,
-            filename,
-          },
+          document: { link: headerDocument.link, filename },
         },
       ],
     });
   }
 
-  // 2) BODY (tetap sama seperti sebelumnya)
+  // BODY
   components.push({
     type: "body",
     parameters: (vars && vars.length > 0 ? vars : [""]).map((v) => ({
@@ -603,7 +592,7 @@ async function sendWaTemplate({
 
   const resp = await axios.post(url, body, {
     headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
+      Authorization: `Bearer ${ctx.wa_token}`,
       "Content-Type": "application/json",
     },
   });
@@ -621,34 +610,22 @@ async function sendWaTemplate({
 
 // =======================================================
 // 5) Helper: kirim pesan custom (text + optional media)
-//    arg: { to, text, media, phone_number_id }
 // =======================================================
-async function sendCustomMessage({ to, text, media, phone_number_id }) {
-  const phoneId = phone_number_id || DEFAULT_PHONE_NUMBER_ID;
-  if (!phoneId) {
-    throw new Error("PHONE_NUMBER_ID belum diset");
-  }
+async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
+  const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
+  if (!phoneId) throw new Error("PHONE_NUMBER_ID belum tersedia (user/school/default)");
 
-  const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/messages`;
+  const url = `https://graph.facebook.com/${ctx.wa_version}/${phoneId}/messages`;
 
   let body;
 
   if (media && media.type && media.link) {
-    const mType = String(media.type).toLowerCase(); // "document", "image", ...
+    const mType = String(media.type).toLowerCase();
 
     if (mType === "document") {
-      // 🔥 PAKAI filename dari media.filename
       let filename = (media.filename || "").trim();
-
-      // kalau kosong → default
-      if (!filename) {
-        filename = "document.pdf";
-      }
-
-      // pastikan ada .pdf di belakang
-      if (!filename.toLowerCase().endsWith(".pdf")) {
-        filename += ".pdf";
-      }
+      if (!filename) filename = "document.pdf";
+      if (!filename.toLowerCase().endsWith(".pdf")) filename += ".pdf";
 
       body = {
         messaging_product: "whatsapp",
@@ -656,12 +633,11 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
         type: "document",
         document: {
           link: media.link,
-          filename, // ⬅️ INI YANG DILIHAT WA
+          filename,
           ...(text ? { caption: text } : {}),
         },
       };
     } else {
-      // image / video / dll
       body = {
         messaging_product: "whatsapp",
         to,
@@ -673,24 +649,19 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
       };
     }
   } else {
-    // text only
     body = {
       messaging_product: "whatsapp",
       to,
       type: "text",
-      text: {
-        body: text || "",
-        preview_url: false,
-      },
+      text: { body: text || "", preview_url: false },
     };
   }
 
-  // DEBUG: cek apa yang benar-benar dikirim
   console.log("DEBUG sendCustomMessage body:", JSON.stringify(body, null, 2));
 
   const resp = await axios.post(url, body, {
     headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
+      Authorization: `Bearer ${ctx.wa_token}`,
       "Content-Type": "application/json",
     },
   });
@@ -703,24 +674,15 @@ async function sendCustomMessage({ to, text, media, phone_number_id }) {
 // =======================================================
 app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
   try {
-    const {
-      template_name,
-      rows,
-      phone_number_id,
-      sender_phone,
-      followup,
-      scheduled_at,
-    } = req.body || {};
+    const ctx = await getCtxByUserId(req.user.sub);
+
+    const { template_name, rows, phone_number_id, sender_phone, followup, scheduled_at } = req.body || {};
 
     if (!template_name) {
-      return res
-        .status(400)
-        .json({ status: "error", error: "template_name wajib diisi" });
+      return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
     }
     if (!Array.isArray(rows) || !rows.length) {
-      return res
-        .status(400)
-        .json({ status: "error", error: "rows harus array minimal 1" });
+      return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
     }
 
     console.log("📨 /kirimpesan/broadcast REQUEST:", {
@@ -729,23 +691,19 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       sender_phone,
       phone_number_id,
       scheduled_at,
+      school_key: ctx.school_key,
+      user_id: ctx.user_id,
     });
 
     // 🔍 Ambil metadata template SEKALI saja
-    const { paramCount, language } = await getTemplateMetadata(template_name);
-    console.log("Template metadata:", { paramCount, language });
+    const { paramCount, language } = await getTemplateMetadata(ctx, template_name);
 
     // --- cek apakah ini broadcast terjadwal? ---
     const JAKARTA_OFFSET_MIN = 7 * 60; // +07:00
-
     function parseJakartaLocalToUtc(str) {
-      // str contoh: "2025-12-02T13:20" dari <input type="datetime-local">
       const dLocal = new Date(str);
       if (isNaN(dLocal.getTime())) return null;
-
-      const localMs = dLocal.getTime();
-      // konversi "jam Jakarta" → UTC
-      const utcMs = localMs - JAKARTA_OFFSET_MIN * 60 * 1000;
+      const utcMs = dLocal.getTime() - JAKARTA_OFFSET_MIN * 60 * 1000;
       return new Date(utcMs);
     }
 
@@ -756,11 +714,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       const dUtc = parseJakartaLocalToUtc(scheduled_at);
       if (dUtc) {
         scheduledDate = dUtc;
-
-        // kalau jadwal lebih dari 15 detik ke depan → dianggap scheduled
-        if (dUtc.getTime() > Date.now() + 15 * 1000) {
-          isScheduled = true;
-        }
+        if (dUtc.getTime() > Date.now() + 15 * 1000) isScheduled = true;
       }
     }
 
@@ -776,31 +730,32 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     }
 
     // Buat ID unik untuk broadcast ini
-    const broadcastId =
-      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    const broadcastId = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 
-    // Resolve phone_number_id kalau cuma kirim sender_phone
+    // Resolve phone_number_id:
+    // Priority:
+    // 1) payload.phone_number_id (manual pilih)
+    // 2) resolve by sender_phone (kalau diisi)
+    // 3) ctx.phone_number_id (effective default per user/school)
     let effectivePhoneId = phone_number_id || null;
 
     if (!effectivePhoneId && sender_phone) {
       try {
-        const phones = await getWabaPhoneNumbers();
+        const phones = await getWabaPhoneNumbers(ctx);
         const match = phones.find(
           (p) =>
             String(p.display_phone_number).replace(/\s+/g, "") ===
             String(sender_phone).replace(/\s+/g, "")
         );
-        if (match) {
-          effectivePhoneId = match.id;
-        } else {
-          console.warn("sender_phone tidak ditemukan di WABA:", sender_phone);
-        }
+        if (match) effectivePhoneId = match.id;
+        else console.warn("sender_phone tidak ditemukan di WABA:", sender_phone);
       } catch (e) {
-        console.warn(
-          "Gagal resolve sender_phone → phone_number_id:",
-          e.message
-        );
+        console.warn("Gagal resolve sender_phone → phone_number_id:", e.message);
       }
+    }
+
+    if (!effectivePhoneId) {
+      effectivePhoneId = ctx.phone_number_id || null;
     }
 
     // --- 1. Simpan broadcast ke Postgres ---
@@ -811,8 +766,8 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
        ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)`,
       [
         broadcastId,
-        scheduledDate, // bisa null
-        isScheduled ? "scheduled" : "sent", // status awal
+        scheduledDate,
+        isScheduled ? "scheduled" : "sent",
         template_name,
         sender_phone || null,
         effectivePhoneId || null,
@@ -826,7 +781,6 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         const phone = row.phone || row.to;
         if (!phone) continue;
 
-        // siapkan vars_json
         const varsMap = {};
         Object.keys(row)
           .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
@@ -843,11 +797,11 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
              template_ok, template_http_status, template_error, created_at
            ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NULL, NULL, NULL, NOW())`,
           [
-            broadcastId, // $1
-            phone, // $2
-            Object.keys(varsMap).length ? varsMap : null, // $3
-            followMedia, // $4
-            followMediaFilename, // $5
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            followMedia,
+            followMediaFilename,
           ]
         );
       }
@@ -861,31 +815,23 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       });
     }
 
-    // --- 3. Kalau TIDAK ada schedule → kirim langsung seperti biasa ---
+    // --- 3. Kalau TIDAK ada schedule → kirim langsung ---
     const results = [];
 
     for (const row of rows) {
       const phone = row.phone || row.to;
       if (!phone) continue;
 
-      // Simpan mapping nomor → row + broadcastId (dipakai webhook)
-      lastBroadcastRowsByPhone[String(phone)] = {
-        row,
-        broadcastId,
-      };
+      lastBroadcastRowsByPhone[String(phone)] = { row, broadcastId };
 
-      // Ambil semua vars dari row (untuk disimpan di DB)
+      // vars
       let vars = row.vars;
       const varsMap = {};
 
       if (!Array.isArray(vars)) {
         const varKeys = Object.keys(row)
           .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
-          .sort((a, b) => {
-            const na = parseInt(a.replace("var", ""), 10);
-            const nb = parseInt(b.replace("var", ""), 10);
-            return na - nb;
-          });
+          .sort((a, b) => parseInt(a.replace("var", ""), 10) - parseInt(b.replace("var", ""), 10));
 
         vars = varKeys.map((k) => {
           varsMap[k] = row[k];
@@ -897,30 +843,25 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         });
       }
 
-      // Ambil hanya sebanyak param yang diminta template
       const varsForTemplate = vars.slice(0, paramCount);
 
       const followMedia = row.follow_media || null;
       const followMediaFilename = row.follow_media_filename || null;
-      
-      // Siapkan headerDocument untuk template
+
       const headerDocument = followMedia
-        ? {
-            link: followMedia,
-            filename: followMediaFilename || null,
-          }
+        ? { link: followMedia, filename: followMediaFilename || null }
         : null;
-      
+
       try {
-        const r = await sendWaTemplate({
+        const r = await sendWaTemplate(ctx, {
           phone,
           templateName: template_name,
-          templateLanguage: language,   // <– otomatis ikut template
+          templateLanguage: language,
           vars: varsForTemplate,
           phone_number_id: effectivePhoneId,
-          headerDocument,               // 👈 tambahan penting
+          headerDocument,
         });
-  
+
         results.push(r);
 
         await pgPool.query(
@@ -929,23 +870,18 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
              template_ok, template_http_status, template_error, created_at
            ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
           [
-            broadcastId, // $1
-            phone, // $2
-            Object.keys(varsMap).length ? varsMap : null, // $3
-            followMedia, // $4
-            followMediaFilename, // $5
-            true, // $6
-            r.status || null, // $7
-            null, // $8
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            followMedia,
+            followMediaFilename,
+            true,
+            r.status || null,
+            null,
           ]
         );
       } catch (err) {
-        console.error(
-          "Broadcast error for",
-          phone,
-          err.response?.data || err.message
-        );
-
+        console.error("Broadcast error for", phone, err.response?.data || err.message);
         const errorPayload = err.response?.data || err.message;
 
         results.push({
@@ -960,18 +896,16 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW())`,
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
           [
-            broadcastId, // $1
-            phone, // $2
-            Object.keys(varsMap).length ? varsMap : null, // $3
-            followMedia, // $4
-            followMediaFilename, // $5
-            false, // $6
-            err.response?.status || null, // $7
-            typeof errorPayload === "string"
-              ? { message: errorPayload }
-              : errorPayload, // $8
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            followMedia,
+            followMediaFilename,
+            false,
+            err.response?.status || null,
+            typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
           ]
         );
       }
@@ -981,55 +915,32 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     const ok = results.filter((r) => r.ok).length;
     const failed = total - ok;
 
-    res.json({
-      status: "ok",
-      broadcast_id: broadcastId,
-      template_name,
-      count: total,
-      ok,
-      failed,
-      results,
-    });
+    res.json({ status: "ok", broadcast_id: broadcastId, template_name, count: total, ok, failed, results });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast:", err);
-    res.status(500).json({
-      status: "error",
-      error: String(err),
-    });
+    res.status(500).json({ status: "error", error: String(err) });
   }
 });
 
 // =======================================================
 // 7) POST /kirimpesan/custom
-//    Kirim pesan bebas (text + optional media)
-//    + SEKARANG: log ke inbox_messages sebagai outgoing
 // =======================================================
 app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
   try {
+    const ctx = await getCtxByUserId(req.user.sub);
+
     const { to, text, media, phone_number_id } = req.body || {};
 
     if (!to) {
-      return res.status(400).json({
-        status: "error",
-        error: "`to` (nomor tujuan) wajib diisi",
-      });
+      return res.status(400).json({ status: "error", error: "`to` (nomor tujuan) wajib diisi" });
     }
     if (!text && !media) {
-      return res.status(400).json({
-        status: "error",
-        error: "Minimal text atau media harus diisi",
-      });
+      return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
     }
 
-    // 1) Kirim ke WhatsApp API
-    const waRes = await sendCustomMessage({
-      to,
-      text,
-      media,
-      phone_number_id,
-    });
+    const waRes = await sendCustomMessage(ctx, { to, text, media, phone_number_id });
 
-    // 2) Simpan sebagai pesan OUTGOING di inbox_messages
+    // log outgoing
     try {
       await pgPool.query(
         `
@@ -1038,33 +949,21 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
         `,
         [
           to,
-          media ? "outgoing_media" : "outgoing", // penting buat deteksi bubble hijau
+          media ? "outgoing_media" : "outgoing",
           text || null,
-          false, // is_quick_reply
-          null, // broadcast_id
+          false,
+          null,
           JSON.stringify(waRes || {}),
         ]
       );
     } catch (dbErr) {
       console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
-      // jangan throw supaya response ke FE tetap ok
     }
 
-    // 3) Balikkan response ke FE
-    res.json({
-      status: "ok",
-      to,
-      wa_response: waRes,
-    });
+    res.json({ status: "ok", to, wa_response: waRes });
   } catch (err) {
-    console.error(
-      "Error /kirimpesan/custom:",
-      err.response?.data || err.message
-    );
-    res.status(500).json({
-      status: "error",
-      error: err.response?.data || err.message,
-    });
+    console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
+    res.status(500).json({ status: "error", error: err.response?.data || err.message });
   }
 });
 
@@ -1085,29 +984,22 @@ function applyFollowupTemplate(text, row) {
 
 // Bangun nama file dari template (mis: "Surat penerimaan {{1}}")
 function buildFilenameFromTemplate(filenameTpl, row) {
-  // 1) Kalau per nomor sudah ada follow_media_filename, pakai itu
   if (row && row.follow_media_filename) {
     let name = String(row.follow_media_filename).trim();
-    if (!name.toLowerCase().endsWith(".pdf")) {
-      name += ".pdf";
-    }
+    if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
     return name;
   }
 
-  // 2) Kalau ada template filename (static_media.filename), pakai itu + {{var}} replacement
   if (filenameTpl) {
     let name = applyFollowupTemplate(filenameTpl, row).trim();
-    if (!name.toLowerCase().endsWith(".pdf")) {
-      name += ".pdf";
-    }
+    if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
     return name;
   }
 
-  // 3) Fallback
   return "Lampiran";
 }
 
-// Ambil info media dari 1 pesan WA (image / document / video / audio)
+// Ambil info media dari 1 pesan WA
 function extractMediaInfoFromMessage(msg) {
   let mediaType = null;
   let mediaId = null;
@@ -1137,7 +1029,7 @@ function extractMediaInfoFromMessage(msg) {
   return { mediaType, mediaId, mediaFilename, mediaCaption };
 }
 
-// ========== VERIFIKASI WEBHOOK (saat set di Facebook Developer) ==========
+// ========== VERIFIKASI WEBHOOK ==========
 app.get("/kirimpesan/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -1150,7 +1042,7 @@ app.get("/kirimpesan/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ========== HANDLE PESAN MASUK (BUTTON / TEXT / INTERACTIVE) ==========
+// ========== HANDLE PESAN MASUK ==========
 app.post("/kirimpesan/webhook", async (req, res) => {
   console.log("📥 WH Incoming:", JSON.stringify(req.body, null, 2));
 
@@ -1169,119 +1061,74 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     let triggerText = "";
     const phoneNumberId = value.metadata?.phone_number_id || null;
 
-    // Ambil teks yang dikirim user (button / interactive / text biasa)
     if (msg.type === "text" && msg.text) {
       triggerText = msg.text.body || "";
     } else if (msg.type === "button" && msg.button) {
       triggerText = msg.button.text || msg.button.payload || "";
     } else if (msg.type === "interactive" && msg.interactive) {
       if (msg.interactive.button_reply) {
-        triggerText =
-          msg.interactive.button_reply.title ||
-          msg.interactive.button_reply.id ||
-          "";
+        triggerText = msg.interactive.button_reply.title || msg.interactive.button_reply.id || "";
       } else if (msg.interactive.list_reply) {
-        triggerText =
-          msg.interactive.list_reply.title ||
-          msg.interactive.list_reply.id ||
-          "";
+        triggerText = msg.interactive.list_reply.title || msg.interactive.list_reply.id || "";
       }
     }
 
-    // Ambil info media (kalau pesan image/video/audio/document)
-    const {
-      mediaType,
-      mediaId,
-      mediaFilename,
-      mediaCaption,
-    } = extractMediaInfoFromMessage(msg);
+    const { mediaType, mediaId, mediaFilename, mediaCaption } = extractMediaInfoFromMessage(msg);
 
     console.log("Type:", msg.type, "from:", from, "text:", triggerText);
 
-    // ====== MAP KE ROW BROADCAST TERAKHIR ======
-    // (diisi waktu /kirimpesan/broadcast kirim atau run-scheduled)
     const mapEntry = lastBroadcastRowsByPhone[String(from)] || null;
     const row = mapEntry ? mapEntry.row : null;
     const broadcastId = mapEntry ? mapEntry.broadcastId : null;
 
-    // ====== SIMPAN KE inbox_messages SELALU ======
+    // simpan inbox
     try {
-      const isQuickReply =
-        !!triggerText && (msg.type === "button" || msg.type === "interactive");
+      const isQuickReply = !!triggerText && (msg.type === "button" || msg.type === "interactive");
 
-    await pgPool.query(
-      `INSERT INTO inbox_messages
-         (phone,
-          message_type,
-          message_text,
-          raw_json,
-          broadcast_id,
-          is_quick_reply,
-          media_type,
-          media_id,
-          media_filename,
-          media_caption,
-          phone_number_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [
-        from,
-        msg.type || null,
-        triggerText || null,
-        JSON.stringify(req.body || {}),
-        broadcastId || null,
-        isQuickReply,
-        mediaType,
-        mediaId,
-        mediaFilename,
-        mediaCaption,
-        phoneNumberId,       // ⬅️ nomor pengirim WABA
-      ]
-    );
-
+      await pgPool.query(
+        `INSERT INTO inbox_messages
+         (phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply,
+          media_type, media_id, media_filename, media_caption, phone_number_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [
+          from,
+          msg.type || null,
+          triggerText || null,
+          JSON.stringify(req.body || {}),
+          broadcastId || null,
+          isQuickReply,
+          mediaType,
+          mediaId,
+          mediaFilename,
+          mediaCaption,
+          phoneNumberId,
+        ]
+      );
     } catch (e) {
       console.error("Insert inbox_messages error:", e);
     }
 
-    // ====== KALAU BUKAN "BERSEDIA" → TIDAK BALAS APA-APA ======
+    // kalau bukan BERSEDIA -> diam
     if (!triggerText || !triggerText.toUpperCase().includes("BERSEDIA")) {
       return res.sendStatus(200);
     }
 
-    // ====== KALAU TIDAK ADA CONFIG FOLLOW-UP → JUGA DIEM ======
+    // kalau tidak ada followup config -> diam
     if (!lastFollowupConfig || !lastFollowupConfig.text) {
       console.log("No followup config, ignore.");
       return res.sendStatus(200);
     }
 
-    // ====== BANGUN TEKS FOLLOW-UP DARI TEMPLATE {{1}},{{2}} ======
     const text = applyFollowupTemplate(lastFollowupConfig.text, row);
 
-    // ====== SIAPKAN MEDIA (PDF) ======
+    // media (PDF)
     let media = null;
-
-    // template filename dari frontend (boleh ada {{1}}, {{2}})
     const filenameTpl = lastFollowupConfig.static_media?.filename || null;
     const finalFilename = buildFilenameFromTemplate(filenameTpl, row);
-    console.log(
-      "DEBUG followup filenameTpl:",
-      filenameTpl,
-      "finalFilename:",
-      finalFilename
-    );
 
-    // PRIORITAS:
-    // 1) follow_media di row (khusus nomor itu)
-    // 2) static_media dari config (sama untuk semua)
     if (row && row.follow_media) {
-      media = {
-        type: "document",
-        link: row.follow_media,
-        filename: finalFilename,
-      };
-    } else if (
-      lastFollowupConfig.static_media &&
-      lastFollowupConfig.static_media.link
-    ) {
+      media = { type: "document", link: row.follow_media, filename: finalFilename };
+    } else if (lastFollowupConfig.static_media && lastFollowupConfig.static_media.link) {
       media = {
         type: lastFollowupConfig.static_media.type || "document",
         link: lastFollowupConfig.static_media.link,
@@ -1289,16 +1136,22 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       };
     }
 
-    // ====== KIRIM KE WHATSAPP MENGGUNAKAN sendCustomMessage() ======
-    // (fungsi ini sudah ada di atas dan sudah benar soal filename & caption)
-    try {
-      const waRes = await sendCustomMessage({
-        to: from,
-        text,
-        media,
-        // pakai default PHONE_NUMBER_ID
-      });
+    // ⚠️ Follow-up butuh token.
+    // Karena webhook tidak membawa userId, kita pakai ENV fallback bila ada.
+    // Untuk mode multi-school yang benar, nanti kita mapping phone_number_id -> school_id.
+    const followCtx = {
+      wa_token: ENV_WA_TOKEN,
+      wa_version: ENV_WA_VERSION,
+      phone_number_id: phoneNumberId || ENV_DEFAULT_PHONE_NUMBER_ID,
+    };
 
+    if (!followCtx.wa_token) {
+      console.warn("WA_TOKEN ENV belum diset; follow-up tidak bisa dikirim.");
+      return res.sendStatus(200);
+    }
+
+    try {
+      const waRes = await sendCustomMessage(followCtx, { to: from, text, media });
       console.log("Follow-up sent:", JSON.stringify(waRes, null, 2));
 
       if (broadcastId) {
@@ -1306,21 +1159,11 @@ app.post("/kirimpesan/webhook", async (req, res) => {
           `INSERT INTO broadcast_followups
              (id, broadcast_id, phone, text, has_media, media_link, status, error, at)
            VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'ok',NULL,$6)`,
-          [
-            broadcastId,
-            from,
-            text,
-            !!media,
-            media ? media.link : null,
-            new Date().toISOString(),
-          ]
+          [broadcastId, from, text, !!media, media ? media.link : null, new Date().toISOString()]
         );
       }
     } catch (err) {
-      console.error(
-        "Error sending follow-up:",
-        err.response?.data || err.message
-      );
+      console.error("Error sending follow-up:", err.response?.data || err.message);
 
       if (broadcastId) {
         const errorPayload = err.response?.data || err.message;
@@ -1334,9 +1177,7 @@ app.post("/kirimpesan/webhook", async (req, res) => {
             text,
             !!media,
             media ? media.link : null,
-            typeof errorPayload === "string"
-              ? { message: errorPayload }
-              : errorPayload,
+            typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
             new Date().toISOString(),
           ]
         );
@@ -1353,9 +1194,6 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 // =======================================================
 // 9) LOG BROADCAST (POSTGRES)
 // =======================================================
-
-// Ringkasan semua log (urutan terbaru dulu)
-// GET /kirimpesan/broadcast/logs?limit=20
 app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
@@ -1380,206 +1218,152 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
     `;
 
     const { rows } = await pgPool.query(sql, [limit]);
-
-    res.json({
-      status: "ok",
-      count: rows.length,
-      logs: rows,
-    });
+    res.json({ status: "ok", count: rows.length, logs: rows });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/logs:", err);
     res.status(500).json({ status: "error", error: String(err) });
   }
 });
 
-// Detail satu log
-// GET /kirimpesan/broadcast/logs/:id
-app.get(
-  "/kirimpesan/broadcast/logs/:id",
-  authMiddleware,
-  async (req, res) => {
-    const id = req.params.id;
-    try {
-      const bRes = await pgPool.query(
-        "SELECT * FROM broadcasts WHERE id = $1",
-        [id]
-      );
-      if (!bRes.rows.length) {
-        return res
-          .status(404)
-          .json({ status: "error", error: "Log not found" });
-      }
-      const broadcast = bRes.rows[0];
-
-      const rRes = await pgPool.query(
-        `SELECT * FROM broadcast_recipients
-       WHERE broadcast_id = $1
-       ORDER BY id`,
-        [id]
-      );
-
-      const fRes = await pgPool.query(
-        `SELECT * FROM broadcast_followups
-       WHERE broadcast_id = $1
-       ORDER BY at`,
-        [id]
-      );
-
-      res.json({
-        status: "ok",
-        log: {
-          broadcast,
-          recipients: rRes.rows,
-          followups: fRes.rows,
-        },
-      });
-    } catch (err) {
-      console.error("Error /kirimpesan/broadcast/logs/:id:", err);
-      res.status(500).json({ status: "error", error: String(err) });
+app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
+  const id = req.params.id;
+  try {
+    const bRes = await pgPool.query("SELECT * FROM broadcasts WHERE id = $1", [id]);
+    if (!bRes.rows.length) {
+      return res.status(404).json({ status: "error", error: "Log not found" });
     }
+    const broadcast = bRes.rows[0];
+
+    const rRes = await pgPool.query(
+      `SELECT * FROM broadcast_recipients WHERE broadcast_id = $1 ORDER BY id`,
+      [id]
+    );
+
+    const fRes = await pgPool.query(
+      `SELECT * FROM broadcast_followups WHERE broadcast_id = $1 ORDER BY at`,
+      [id]
+    );
+
+    res.json({
+      status: "ok",
+      log: { broadcast, recipients: rRes.rows, followups: fRes.rows },
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/logs/:id:", err);
+    res.status(500).json({ status: "error", error: String(err) });
   }
-);
+});
 
-// Export CSV
-// GET /kirimpesan/broadcast/logs/:id/csv
-app.get(
-  "/kirimpesan/broadcast/logs/:id/csv",
-  authMiddleware,
-  async (req, res) => {
-    const id = req.params.id;
-    try {
-      const bRes = await pgPool.query(
-        "SELECT * FROM broadcasts WHERE id = $1",
-        [id]
-      );
-      if (!bRes.rows.length) {
-        return res.status(404).send("Log not found");
-      }
+// Export CSV (tetap sama — tidak butuh token)
+app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) => {
+  const id = req.params.id;
+  try {
+    const bRes = await pgPool.query("SELECT * FROM broadcasts WHERE id = $1", [id]);
+    if (!bRes.rows.length) return res.status(404).send("Log not found");
 
-      const rRes = await pgPool.query(
-        `SELECT * FROM broadcast_recipients
-       WHERE broadcast_id = $1
-       ORDER BY id`,
-        [id]
-      );
-      const fRes = await pgPool.query(
-        `SELECT * FROM broadcast_followups
-       WHERE broadcast_id = $1`,
-        [id]
-      );
+    const rRes = await pgPool.query(
+      `SELECT * FROM broadcast_recipients WHERE broadcast_id = $1 ORDER BY id`,
+      [id]
+    );
+    const fRes = await pgPool.query(`SELECT * FROM broadcast_followups WHERE broadcast_id = $1`, [id]);
 
-      const recipients = rRes.rows;
-      const followups = fRes.rows;
+    const recipients = rRes.rows;
+    const followups = fRes.rows;
 
-      const followupMap = {};
-      followups.forEach((f) => {
-        if (!f.phone) return;
-        followupMap[String(f.phone)] = f;
-      });
+    const followupMap = {};
+    followups.forEach((f) => {
+      if (!f.phone) return;
+      followupMap[String(f.phone)] = f;
+    });
 
-      // cari var terbanyak supaya header konsisten
-      let maxVar = 0;
-      recipients.forEach((row) => {
-        const vars = row.vars_json || {};
-        Object.keys(vars).forEach((k) => {
-          const m = /^var(\d+)$/.exec(k);
-          if (m) {
-            const n = parseInt(m[1], 10);
-            if (!isNaN(n) && n > maxVar) maxVar = n;
-          }
-        });
-      });
-
-      const headers = ["phone"];
-      for (let i = 1; i <= maxVar; i++) {
-        headers.push(`var${i}`);
-      }
-      headers.push(
-        "follow_media",
-        "follow_media_filename",
-        "template_ok",
-        "template_http_status",
-        "template_error",
-        "followup_status",
-        "followup_has_media",
-        "followup_media_link",
-        "followup_at"
-      );
-
-      const lines = [];
-      lines.push(headers.join(","));
-
-      recipients.forEach((row) => {
-        const phone = row.phone || "";
-        if (!phone) return;
-
-        const vars = row.vars_json || {};
-        const f = followupMap[String(phone)] || {};
-
-        const cols = [];
-        cols.push(`"${phone}"`);
-
-        for (let i = 1; i <= maxVar; i++) {
-          const key = "var" + i;
-          const v = vars[key] != null ? String(vars[key]) : "";
-          cols.push(`"${v.replace(/"/g, '""')}"`);
+    let maxVar = 0;
+    recipients.forEach((row) => {
+      const vars = row.vars_json || {};
+      Object.keys(vars).forEach((k) => {
+        const m = /^var(\d+)$/.exec(k);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (!isNaN(n) && n > maxVar) maxVar = n;
         }
-
-        const followMedia = row.follow_media || "";
-        const followMediaFilename = row.follow_media_filename || "";
-        cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
-        cols.push(
-          `"${String(followMediaFilename).replace(/"/g, '""')}"`
-        );
-
-        cols.push(row.template_ok ? "1" : "0");
-        cols.push(
-          row.template_http_status != null
-            ? String(row.template_http_status)
-            : ""
-        );
-
-        const errStr =
-          typeof row.template_error === "string"
-            ? row.template_error
-            : row.template_error
-            ? JSON.stringify(row.template_error)
-            : "";
-        cols.push(`"${errStr.replace(/"/g, '""')}"`);
-
-        cols.push(f.status || "");
-        cols.push(f.has_media ? "1" : "0");
-        cols.push(`"${((f.media_link || "") + "").replace(/"/g, '""')}"`);
-        cols.push(f.at ? f.at.toISOString() : "");
-
-        lines.push(cols.join(","));
       });
+    });
 
-      const csv = lines.join("\n");
+    const headers = ["phone"];
+    for (let i = 1; i <= maxVar; i++) headers.push(`var${i}`);
+    headers.push(
+      "follow_media",
+      "follow_media_filename",
+      "template_ok",
+      "template_http_status",
+      "template_error",
+      "followup_status",
+      "followup_has_media",
+      "followup_media_link",
+      "followup_at"
+    );
 
-      res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="broadcast-${id}.csv"`
-      );
-      res.send(csv);
-    } catch (err) {
-      console.error("Error /kirimpesan/broadcast/logs/:id/csv:", err);
-      res.status(500).send("Internal error");
-    }
+    const lines = [];
+    lines.push(headers.join(","));
+
+    recipients.forEach((row) => {
+      const phone = row.phone || "";
+      if (!phone) return;
+
+      const vars = row.vars_json || {};
+      const f = followupMap[String(phone)] || {};
+
+      const cols = [];
+      cols.push(`"${phone}"`);
+
+      for (let i = 1; i <= maxVar; i++) {
+        const key = "var" + i;
+        const v = vars[key] != null ? String(vars[key]) : "";
+        cols.push(`"${v.replace(/"/g, '""')}"`);
+      }
+
+      const followMedia = row.follow_media || "";
+      const followMediaFilename = row.follow_media_filename || "";
+      cols.push(`"${String(followMedia).replace(/"/g, '""')}"`);
+      cols.push(`"${String(followMediaFilename).replace(/"/g, '""')}"`);
+
+      cols.push(row.template_ok ? "1" : "0");
+      cols.push(row.template_http_status != null ? String(row.template_http_status) : "");
+
+      const errStr =
+        typeof row.template_error === "string"
+          ? row.template_error
+          : row.template_error
+          ? JSON.stringify(row.template_error)
+          : "";
+      cols.push(`"${errStr.replace(/"/g, '""')}"`);
+
+      cols.push(f.status || "");
+      cols.push(f.has_media ? "1" : "0");
+      cols.push(`"${((f.media_link || "") + "").replace(/"/g, '""')}"`);
+      cols.push(f.at ? f.at.toISOString() : "");
+
+      lines.push(cols.join(","));
+    });
+
+    const csv = lines.join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="broadcast-${id}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/logs/:id/csv:", err);
+    res.status(500).send("Internal error");
   }
-);
+});
 
 // =======================================================
-// 10) KOTAK MASUK / INBOX (gabung dengan data broadcast)
-//     GET /kirimpesan/inbox?limit=50
+// 10) KOTAK MASUK / INBOX
 // =======================================================
 app.get("/kirimpesan/inbox", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "100", 10);
 
-    const phoneNumberId =
-      req.query.phone_number_id || DEFAULT_PHONE_NUMBER_ID || null;
+    const phoneNumberId = req.query.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID || null;
 
     const sql = `
       SELECT
@@ -1610,10 +1394,7 @@ app.get("/kirimpesan/inbox", async (req, res) => {
 
     const { rows } = await pgPool.query(sql, [limit, phoneNumberId]);
 
-    res.json({
-      status: "ok",
-      messages: rows,
-    });
+    res.json({ status: "ok", messages: rows });
   } catch (err) {
     console.error("Inbox error:", err);
     res.status(500).json({ status: "error", error: "Gagal memuat inbox" });
@@ -1622,12 +1403,9 @@ app.get("/kirimpesan/inbox", async (req, res) => {
 
 // =======================================================
 // 11) JALANKAN BROADCAST YANG DIJADWALKAN
-//     GET /kirimpesan/broadcast/run-scheduled
-//     (dipanggil tiap menit dari Apps Script)
 // =======================================================
 app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
   try {
-    // 1. Ambil semua broadcast yang statusnya "scheduled" dan sudah jatuh tempo
     const { rows: broadcasts } = await pgPool.query(
       `SELECT *
          FROM broadcasts
@@ -1637,39 +1415,42 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
     );
 
     if (!broadcasts.length) {
-      return res.json({
-        status: "ok",
-        ran: [],
-      });
+      return res.json({ status: "ok", ran: [] });
     }
 
     const ran = [];
 
     for (const bc of broadcasts) {
-      // 2. Ambil semua penerima untuk broadcast ini
       const { rows: recipients } = await pgPool.query(
-        `SELECT *
-           FROM broadcast_recipients
-          WHERE broadcast_id = $1`,
+        `SELECT * FROM broadcast_recipients WHERE broadcast_id = $1`,
         [bc.id]
       );
 
       if (!recipients.length) {
-        // kalau nggak ada penerima, tandai sent aja
-        await pgPool.query(
-          `UPDATE broadcasts
-              SET status = 'sent'
-            WHERE id = $1`,
-          [bc.id]
-        );
+        await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
         ran.push({ broadcast_id: bc.id, total: 0, ok: 0, failed: 0 });
         continue;
       }
 
-      // Ambil metadata template sekali saja per broadcast
-      const { paramCount, language } = await getTemplateMetadata(
-        bc.template_name
-      );
+      // NOTE:
+      // run-scheduled sekarang masih butuh ctx.
+      // Cara paling aman: simpan school_id di table broadcasts, lalu ambil ctx by school_id.
+      // Untuk sementara (biar gak nge-block), pakai ENV fallback.
+      const ctx = {
+        wa_token: ENV_WA_TOKEN,
+        wa_version: ENV_WA_VERSION,
+        template_lang: ENV_TEMPLATE_LANG,
+        waba_id: ENV_WABA_ID,
+        phone_number_id: bc.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+      };
+
+      if (!ctx.wa_token || !ctx.waba_id) {
+        console.warn("ENV_WA_TOKEN / ENV_WABA_ID belum ada; run-scheduled tidak bisa jalan.");
+        continue;
+      }
+
+      const { paramCount, language } = await getTemplateMetadata(ctx, bc.template_name);
+
       let okCount = 0;
       let failCount = 0;
 
@@ -1680,45 +1461,31 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         const varsMap = rcp.vars_json || {};
         const varKeys = Object.keys(varsMap)
           .filter((k) => /^var\d+$/.test(k))
-          .sort((a, b) => {
-            const na = parseInt(a.replace("var", ""), 10);
-            const nb = parseInt(b.replace("var", ""), 10);
-            return na - nb;
-          });
+          .sort((a, b) => parseInt(a.replace("var", ""), 10) - parseInt(b.replace("var", ""), 10));
 
         const vars = varKeys.map((k) => varsMap[k]);
         const varsForTemplate = vars.slice(0, paramCount);
 
-        // siapkan row untuk follow-up mapping (webhook)
         const rowForMap = {
           phone,
           follow_media: rcp.follow_media || null,
           follow_media_filename: rcp.follow_media_filename || null,
         };
-        varKeys.forEach((k) => {
-          rowForMap[k] = varsMap[k];
-        });
-        lastBroadcastRowsByPhone[String(phone)] = {
-          row: rowForMap,
-          broadcastId: bc.id,
-        };
-        
-        // 👉 ambil media dari DB untuk header document
+        varKeys.forEach((k) => (rowForMap[k] = varsMap[k]));
+        lastBroadcastRowsByPhone[String(phone)] = { row: rowForMap, broadcastId: bc.id };
+
         const headerDocument = rcp.follow_media
-          ? {
-              link: rcp.follow_media,
-              filename: rcp.follow_media_filename || null,
-            }
+          ? { link: rcp.follow_media, filename: rcp.follow_media_filename || null }
           : null;
-        
+
         try {
-          const r = await sendWaTemplate({
+          const r = await sendWaTemplate(ctx, {
             phone,
             templateName: bc.template_name,
             templateLanguage: language,
             vars: varsForTemplate,
             phone_number_id: bc.phone_number_id || undefined,
-            headerDocument,   // 👈 tambahan
+            headerDocument,
           });
 
           okCount++;
@@ -1744,92 +1511,84 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
             [
               rcp.id,
               err.response?.status || null,
-              typeof errorPayload === "string"
-                ? { message: errorPayload }
-                : errorPayload,
+              typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
             ]
           );
 
-          console.error(
-            "Scheduled broadcast error for",
-            phone,
-            errorPayload
-          );
+          console.error("Scheduled broadcast error for", phone, errorPayload);
         }
       }
 
-      // 3. Tandai broadcast ini sudah dijalankan
-      await pgPool.query(
-        `UPDATE broadcasts
-            SET status = 'sent'
-          WHERE id = $1`,
-        [bc.id]
-      );
+      await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
 
-      ran.push({
-        broadcast_id: bc.id,
-        total: recipients.length,
-        ok: okCount,
-        failed: failCount,
-      });
+      ran.push({ broadcast_id: bc.id, total: recipients.length, ok: okCount, failed: failCount });
     }
 
-    return res.json({
-      status: "ok",
-      ran,
-    });
+    return res.json({ status: "ok", ran });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
-    return res.status(500).json({
-      status: "error",
-      error: String(err),
-    });
+    return res.status(500).json({ status: "error", error: String(err) });
   }
 });
 
 // =======================================================
 //  X) PROXY MEDIA WHATSAPP
-//     GET /kirimpesan/media/:id
-//     Frontend pakai ini sebagai src gambar/video/audio
-//     (DIBIARKAN TANPA AUTH supaya <img src> bisa akses)
+//     GET /kirimpesan/media/:id?school_id=UUID  (recommended)
+//     (tanpa auth untuk <img src>, jadi butuh token via lookup school_id / env fallback)
 // =======================================================
 app.get("/kirimpesan/media/:id", async (req, res) => {
   try {
     const mediaId = req.params.id;
+    if (!mediaId) return res.status(400).send("media id required");
 
-    if (!mediaId) {
-      return res.status(400).send("media id required");
+    // 1) coba ambil token via school_id (query)
+    const schoolId = req.query.school_id || null;
+
+    let ctx = null;
+    if (schoolId) {
+      const { rows } = await pgPool.query(
+        `SELECT waba_id, wa_token, wa_version, template_lang, default_phone_number_id
+         FROM schools
+         WHERE id = $1
+         LIMIT 1`,
+        [schoolId]
+      );
+      if (rows.length) {
+        ctx = {
+          waba_id: rows[0].waba_id,
+          wa_token: rows[0].wa_token,
+          wa_version: rows[0].wa_version || ENV_WA_VERSION,
+        };
+      }
     }
-    if (!WA_TOKEN) {
-      return res.status(500).send("WA_TOKEN belum diset");
+
+    // 2) fallback ENV
+    if (!ctx) {
+      ctx = { wa_token: ENV_WA_TOKEN, wa_version: ENV_WA_VERSION };
     }
+
+    if (!ctx.wa_token) return res.status(500).send("WA_TOKEN belum tersedia");
 
     // 1) Ambil metadata media (url + mime_type)
-    const metaUrl = `https://graph.facebook.com/${WA_VERSION}/${mediaId}`;
+    const metaUrl = `https://graph.facebook.com/${ctx.wa_version}/${mediaId}`;
     const metaResp = await axios.get(metaUrl, {
-      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      headers: { Authorization: `Bearer ${ctx.wa_token}` },
     });
 
     const fileUrl = metaResp.data?.url;
     const mime = metaResp.data?.mime_type || "application/octet-stream";
+    if (!fileUrl) return res.status(404).send("Media URL not found");
 
-    if (!fileUrl) {
-      return res.status(404).send("Media URL not found");
-    }
-
-    // 2) Ambil file sebenarnya dan stream ke client
+    // 2) Stream file
     const fileResp = await axios.get(fileUrl, {
-      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      headers: { Authorization: `Bearer ${ctx.wa_token}` },
       responseType: "stream",
     });
 
     res.setHeader("Content-Type", mime);
     fileResp.data.pipe(res);
   } catch (err) {
-    console.error(
-      "Error proxy media:",
-      err.response?.data || err.message
-    );
+    console.error("Error proxy media:", err.response?.data || err.message);
     res.status(500).send("Error fetching media");
   }
 });
