@@ -108,6 +108,30 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function requireAdmin(req, res, next) {
+  const role = (req.user?.role || "").toLowerCase();
+  if (role !== "admin" && role !== "superadmin") {
+    return res.status(403).json({ status: "error", error: "Forbidden (admin only)" });
+  }
+  next();
+}
+
+// Validasi: phone_number_id harus milik sekolah user (ada di school_phone_numbers)
+async function assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId) {
+  if (!phoneNumberId) return true; // null => balik ke default sekolah
+  const { rows } = await pgPool.query(
+    `SELECT 1
+     FROM school_phone_numbers
+     WHERE school_id = $1 AND phone_number_id = $2
+     LIMIT 1`,
+    [schoolId, String(phoneNumberId)]
+  );
+  if (!rows.length) {
+    throw new Error("phone_number_id tidak terdaftar untuk sekolah ini");
+  }
+  return true;
+}
+
 // =====================================================
 // HELPER: Ambil WA config dari DB berdasarkan userId
 // =====================================================
@@ -1909,6 +1933,165 @@ app.get("/kirimpesan/media/:id", async (req, res) => {
   } catch (err) {
     console.error("Error proxy media:", err.response?.data || err.message);
     res.status(500).send("Error fetching media");
+  }
+});
+
+// =======================================================
+// CHANGE PASSWORD (crypt) — user ganti password sendiri
+// POST /kirimpesan/auth/change-password
+// body: { old_password, new_password }
+// =======================================================
+app.post("/kirimpesan/auth/change-password", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { old_password, new_password } = req.body || {};
+
+    if (!old_password || !new_password) {
+      return res.status(400).json({ status: "error", error: "old_password & new_password wajib" });
+    }
+    if (String(new_password).length < 8) {
+      return res.status(400).json({ status: "error", error: "new_password minimal 8 karakter" });
+    }
+
+    // verif old password via crypt()
+    const chk = await pgPool.query(
+      `SELECT 1
+       FROM users
+       WHERE id = $1
+         AND password_hash = crypt($2, password_hash)
+       LIMIT 1`,
+      [userId, String(old_password)]
+    );
+
+    if (!chk.rows.length) {
+      return res.status(401).json({ status: "error", error: "old_password salah" });
+    }
+
+    await pgPool.query(
+      `UPDATE users
+       SET password_hash = crypt($2, gen_salt('bf'))
+       WHERE id = $1`,
+      [userId, String(new_password)]
+    );
+
+    return res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Error change-password:", err);
+    return res.status(500).json({ status: "error", error: "Internal server error" });
+  }
+});
+
+// =======================================================
+// SET DEFAULT SENDER PER USER
+// PATCH /kirimpesan/users/me/sender
+// body: { phone_number_id: "xxxx" } atau { phone_number_id: null }
+// =======================================================
+app.patch("/kirimpesan/users/me/sender", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const schoolId = req.user.school_id;
+    const { phone_number_id } = req.body || {};
+
+    // null/"" => reset ke default sekolah
+    const pnid =
+      phone_number_id === null || phone_number_id === "" || typeof phone_number_id === "undefined"
+        ? null
+        : String(phone_number_id);
+
+    await assertPhoneNumberBelongsToSchool(pnid, schoolId);
+
+    await pgPool.query(
+      `UPDATE users
+       SET phone_number_id = $2
+       WHERE id = $1`,
+      [userId, pnid]
+    );
+
+    return res.json({ status: "ok", phone_number_id: pnid });
+  } catch (err) {
+    console.error("Error set sender:", err);
+    return res.status(400).json({ status: "error", error: err.message || "Bad request" });
+  }
+});
+
+// =======================================================
+// LIST USERS (per school)
+// GET /kirimpesan/users
+// =======================================================
+app.get("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.school_id;
+
+    const { rows } = await pgPool.query(
+      `SELECT
+         id,
+         username,
+         display_name_user,
+         role,
+         phone_number_id,
+         created_at
+       FROM users
+       WHERE school_id = $1
+       ORDER BY created_at ASC`,
+      [schoolId]
+    );
+
+    return res.json({ status: "ok", count: rows.length, users: rows });
+  } catch (err) {
+    console.error("Error list users:", err);
+    return res.status(500).json({ status: "error", error: "Internal server error" });
+  }
+});
+
+// =======================================================
+// CREATE USER (per school)
+// POST /kirimpesan/users
+// body: { username, password, display_name_user, role, phone_number_id }
+// =======================================================
+app.post("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.school_id;
+    const {
+      username,
+      password,
+      display_name_user,
+      role,
+      phone_number_id,
+    } = req.body || {};
+
+    if (!username || !password) {
+      return res.status(400).json({ status: "error", error: "username & password wajib" });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ status: "error", error: "password minimal 8 karakter" });
+    }
+
+    const uname = String(username).trim().toLowerCase();
+
+    // role default
+    const r = role ? String(role).trim().toLowerCase() : "operator";
+
+    const pnid =
+      phone_number_id === null || phone_number_id === "" || typeof phone_number_id === "undefined"
+        ? null
+        : String(phone_number_id);
+
+    await assertPhoneNumberBelongsToSchool(pnid, schoolId);
+
+    const { rows } = await pgPool.query(
+      `INSERT INTO users
+         (username, password_hash, display_name_user, role, school_id, phone_number_id, created_at)
+       VALUES
+         ($1, crypt($2, gen_salt('bf')), $3, $4, $5, $6, NOW())
+       RETURNING id, username, display_name_user, role, school_id, phone_number_id, created_at`,
+      [uname, String(password), display_name_user || null, r, schoolId, pnid]
+    );
+
+    return res.json({ status: "ok", user: rows[0] });
+  } catch (err) {
+    const msg = err?.code === "23505" ? "username sudah dipakai" : (err.message || "Internal error");
+    console.error("Error create user:", err);
+    return res.status(400).json({ status: "error", error: msg });
   }
 });
 
