@@ -170,6 +170,173 @@ async function getCtxByUserId(userId) {
   throw new Error("School config tidak ditemukan untuk user ini (dan ENV fallback tidak tersedia)");
 }
 
+
+
+// =====================================================
+// HELPER: Ambil WA config dari DB berdasarkan school_id
+// =====================================================
+async function getCtxBySchoolId(schoolId) {
+  if (!schoolId) throw new Error("schoolId kosong");
+  const { rows } = await pgPool.query(
+    `SELECT
+        id AS school_id,
+        school_key,
+        display_name AS school_name,
+        alamat,
+        waba_id,
+        wa_token,
+        wa_version,
+        template_lang,
+        default_phone_number_id
+     FROM schools
+     WHERE id = $1
+     LIMIT 1`,
+    [schoolId]
+  );
+
+  if (rows.length) {
+    return {
+      user_id: null,
+      username: null,
+      display_name_user: null,
+      role: "admin",
+      school_id: rows[0].school_id,
+      school_key: rows[0].school_key,
+      school_name: rows[0].school_name,
+      alamat: rows[0].alamat,
+      waba_id: rows[0].waba_id,
+      wa_token: rows[0].wa_token,
+      wa_version: rows[0].wa_version || ENV_WA_VERSION,
+      template_lang: rows[0].template_lang || ENV_TEMPLATE_LANG,
+      default_phone_number_id: rows[0].default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+      phone_number_id: rows[0].default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+    };
+  }
+
+  // fallback DEV
+  if (ENV_WABA_ID && ENV_WA_TOKEN) {
+    return {
+      user_id: null,
+      username: null,
+      display_name_user: null,
+      role: "admin",
+      school_id: schoolId,
+      school_key: null,
+      school_name: null,
+      alamat: null,
+      waba_id: ENV_WABA_ID,
+      wa_token: ENV_WA_TOKEN,
+      wa_version: ENV_WA_VERSION,
+      template_lang: ENV_TEMPLATE_LANG,
+      default_phone_number_id: ENV_DEFAULT_PHONE_NUMBER_ID,
+      phone_number_id: ENV_DEFAULT_PHONE_NUMBER_ID,
+    };
+  }
+
+  throw new Error("School config tidak ditemukan (school_id)");
+}
+
+// =====================================================
+// HELPER: Ambil WA config dari DB berdasarkan phone_number_id (untuk webhook / media proxy)
+// Priority:
+// 1) school_phone_numbers.phone_number_id
+// 2) schools.default_phone_number_id
+// =====================================================
+async function getCtxByPhoneNumberId(phoneNumberId) {
+  if (!phoneNumberId) throw new Error("phone_number_id kosong");
+
+  // 1) coba mapping table (kalau sudah dibuat)
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT
+         spn.school_id,
+         s.school_key,
+         s.display_name AS school_name,
+         s.alamat,
+         s.waba_id,
+         s.wa_token,
+         s.wa_version,
+         s.template_lang,
+         s.default_phone_number_id
+       FROM school_phone_numbers spn
+       JOIN schools s ON s.id = spn.school_id
+       WHERE spn.phone_number_id = $1
+       LIMIT 1`,
+      [String(phoneNumberId)]
+    );
+    if (rows.length) {
+      return {
+        user_id: null,
+        username: null,
+        display_name_user: null,
+        role: "admin",
+        school_id: rows[0].school_id,
+        school_key: rows[0].school_key,
+        school_name: rows[0].school_name,
+        alamat: rows[0].alamat,
+        waba_id: rows[0].waba_id,
+        wa_token: rows[0].wa_token,
+        wa_version: rows[0].wa_version || ENV_WA_VERSION,
+        template_lang: rows[0].template_lang || ENV_TEMPLATE_LANG,
+        default_phone_number_id: rows[0].default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+        phone_number_id: String(phoneNumberId),
+      };
+    }
+  } catch (e) {
+    // table mungkin belum ada — ignore
+  }
+
+  // 2) fallback: cari sekolah yang default_phone_number_id = phoneNumberId
+  const { rows: r2 } = await pgPool.query(
+    `SELECT
+        id AS school_id,
+        school_key,
+        display_name AS school_name,
+        alamat,
+        waba_id,
+        wa_token,
+        wa_version,
+        template_lang,
+        default_phone_number_id
+     FROM schools
+     WHERE default_phone_number_id = $1
+     LIMIT 1`,
+    [String(phoneNumberId)]
+  );
+
+  if (r2.length) {
+    return {
+      user_id: null,
+      username: null,
+      display_name_user: null,
+      role: "admin",
+      school_id: r2[0].school_id,
+      school_key: r2[0].school_key,
+      school_name: r2[0].school_name,
+      alamat: r2[0].alamat,
+      waba_id: r2[0].waba_id,
+      wa_token: r2[0].wa_token,
+      wa_version: r2[0].wa_version || ENV_WA_VERSION,
+      template_lang: r2[0].template_lang || ENV_TEMPLATE_LANG,
+      default_phone_number_id: r2[0].default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+      phone_number_id: String(phoneNumberId),
+    };
+  }
+
+  // 3) fallback DEV
+  if (ENV_WA_TOKEN) {
+    return {
+      wa_token: ENV_WA_TOKEN,
+      wa_version: ENV_WA_VERSION,
+      template_lang: ENV_TEMPLATE_LANG,
+      waba_id: ENV_WABA_ID,
+      default_phone_number_id: ENV_DEFAULT_PHONE_NUMBER_ID,
+      phone_number_id: String(phoneNumberId),
+    };
+  }
+
+  throw new Error("Tidak bisa resolve config dari phone_number_id");
+}
 // =======================================================
 // ROOT SIMPLE CEK ONLINE
 // =======================================================
@@ -319,7 +486,26 @@ app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
       is_default: String(r.id) === String(ctx.default_phone_number_id || ""),
     }));
 
-    res.json({ status: "ok", count: senders.length, senders });
+    // best-effort: simpan mapping phone_number_id -> school_id (untuk webhook & media proxy)
+try {
+  if (ctx.school_id) {
+    for (const r of rows) {
+      await pgPool.query(
+        `INSERT INTO school_phone_numbers (school_id, phone_number_id, display_phone_number, verified_name)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (phone_number_id)
+         DO UPDATE SET school_id = EXCLUDED.school_id,
+                       display_phone_number = EXCLUDED.display_phone_number,
+                       verified_name = EXCLUDED.verified_name`,
+        [ctx.school_id, String(r.id), r.display_phone_number || null, r.verified_name || null]
+      );
+    }
+  }
+} catch (e) {
+  // ignore kalau tabel belum ada
+}
+
+res.json({ status: "ok", count: senders.length, senders });
   } catch (err) {
     console.error("Error /kirimpesan/senders:", err.response?.data || err.message);
     res.status(500).json({ status: "error", error: err.response?.data || err.message });
@@ -762,8 +948,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     await pgPool.query(
       `INSERT INTO broadcasts (
          id, created_at, scheduled_at, status,
-         template_name, sender_phone, phone_number_id, followup_enabled
-       ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)`,
+         template_name, sender_phone, phone_number_id, followup_enabled,
+         school_id
+       ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8)`,
       [
         broadcastId,
         scheduledDate,
@@ -772,6 +959,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         sender_phone || null,
         effectivePhoneId || null,
         !!(followup && followup.text),
+        ctx.school_id || null,
       ]
     );
 
@@ -1136,19 +1324,31 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       };
     }
 
-    // ⚠️ Follow-up butuh token.
-    // Karena webhook tidak membawa userId, kita pakai ENV fallback bila ada.
-    // Untuk mode multi-school yang benar, nanti kita mapping phone_number_id -> school_id.
-    const followCtx = {
-      wa_token: ENV_WA_TOKEN,
-      wa_version: ENV_WA_VERSION,
-      phone_number_id: phoneNumberId || ENV_DEFAULT_PHONE_NUMBER_ID,
-    };
+    
+// Follow-up butuh token. Untuk multi-school:
+// resolve via phone_number_id (metadata.phone_number_id) -> schools.wa_token
+let followCtx = null;
+try {
+  if (phoneNumberId) {
+    followCtx = await getCtxByPhoneNumberId(phoneNumberId);
+  }
+} catch (e) {
+  followCtx = null;
+}
 
-    if (!followCtx.wa_token) {
-      console.warn("WA_TOKEN ENV belum diset; follow-up tidak bisa dikirim.");
-      return res.sendStatus(200);
-    }
+// fallback DEV
+if (!followCtx) {
+  followCtx = {
+    wa_token: ENV_WA_TOKEN,
+    wa_version: ENV_WA_VERSION,
+    phone_number_id: phoneNumberId || ENV_DEFAULT_PHONE_NUMBER_ID,
+  };
+}
+
+if (!followCtx.wa_token) {
+  console.warn("Token WA tidak tersedia; follow-up tidak bisa dikirim.");
+  return res.sendStatus(200);
+}
 
     try {
       const waRes = await sendCustomMessage(followCtx, { to: from, text, media });
@@ -1432,22 +1632,32 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         continue;
       }
 
-      // NOTE:
-      // run-scheduled sekarang masih butuh ctx.
-      // Cara paling aman: simpan school_id di table broadcasts, lalu ambil ctx by school_id.
-      // Untuk sementara (biar gak nge-block), pakai ENV fallback.
-      const ctx = {
-        wa_token: ENV_WA_TOKEN,
-        wa_version: ENV_WA_VERSION,
-        template_lang: ENV_TEMPLATE_LANG,
-        waba_id: ENV_WABA_ID,
-        phone_number_id: bc.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
-      };
+      
+// Ambil ctx berdasarkan school_id dari broadcast (multi-school beneran)
+let ctx = null;
+try {
+  if (bc.school_id) {
+    ctx = await getCtxBySchoolId(bc.school_id);
+  }
+} catch (e) {
+  ctx = null;
+}
 
-      if (!ctx.wa_token || !ctx.waba_id) {
-        console.warn("ENV_WA_TOKEN / ENV_WABA_ID belum ada; run-scheduled tidak bisa jalan.");
-        continue;
-      }
+// fallback (DEV) kalau school_id belum ada
+if (!ctx) {
+  ctx = {
+    wa_token: ENV_WA_TOKEN,
+    wa_version: ENV_WA_VERSION,
+    template_lang: ENV_TEMPLATE_LANG,
+    waba_id: ENV_WABA_ID,
+    phone_number_id: bc.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+  };
+}
+
+if (!ctx.wa_token || !ctx.waba_id) {
+  console.warn("ctx WA tidak tersedia; run-scheduled skip broadcast:", bc.id);
+  continue;
+}
 
       const { paramCount, language } = await getTemplateMetadata(ctx, bc.template_name);
 
@@ -1533,36 +1743,66 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
 
 // =======================================================
 //  X) PROXY MEDIA WHATSAPP
-//     GET /kirimpesan/media/:id?school_id=UUID  (recommended)
-//     (tanpa auth untuk <img src>, jadi butuh token via lookup school_id / env fallback)
+//     GET /kirimpesan/media/:id
+//     Frontend pakai ini sebagai src gambar/video/audio.
+//     (tanpa auth untuk <img src>, jadi token harus kita resolve dari DB)
+// Resolution priority:
+//  1) query ?school_id=UUID
+//  2) query ?phone_number_id=xxxxx
+//  3) lookup inbox_messages by media_id -> phone_number_id -> school
+//  4) ENV fallback (DEV)
 // =======================================================
 app.get("/kirimpesan/media/:id", async (req, res) => {
   try {
     const mediaId = req.params.id;
     if (!mediaId) return res.status(400).send("media id required");
 
-    // 1) coba ambil token via school_id (query)
     const schoolId = req.query.school_id || null;
+    const phoneNumberIdQ = req.query.phone_number_id || null;
 
     let ctx = null;
+
+    // 1) explicit school_id
     if (schoolId) {
-      const { rows } = await pgPool.query(
-        `SELECT waba_id, wa_token, wa_version, template_lang, default_phone_number_id
-         FROM schools
-         WHERE id = $1
-         LIMIT 1`,
-        [schoolId]
-      );
-      if (rows.length) {
-        ctx = {
-          waba_id: rows[0].waba_id,
-          wa_token: rows[0].wa_token,
-          wa_version: rows[0].wa_version || ENV_WA_VERSION,
-        };
+      try {
+        ctx = await getCtxBySchoolId(schoolId);
+      } catch (e) {
+        ctx = null;
       }
     }
 
-    // 2) fallback ENV
+    // 2) explicit phone_number_id
+    if (!ctx && phoneNumberIdQ) {
+      try {
+        ctx = await getCtxByPhoneNumberId(phoneNumberIdQ);
+      } catch (e) {
+        ctx = null;
+      }
+    }
+
+    // 3) lookup dari DB (media_id -> phone_number_id)
+    if (!ctx) {
+      try {
+        const { rows } = await pgPool.query(
+          `SELECT phone_number_id
+             FROM inbox_messages
+            WHERE media_id = $1
+              AND phone_number_id IS NOT NULL
+            ORDER BY at DESC
+            LIMIT 1`,
+          [String(mediaId)]
+        );
+
+        const pnid = rows[0]?.phone_number_id || null;
+        if (pnid) {
+          ctx = await getCtxByPhoneNumberId(pnid);
+        }
+      } catch (e) {
+        ctx = null;
+      }
+    }
+
+    // 4) fallback DEV
     if (!ctx) {
       ctx = { wa_token: ENV_WA_TOKEN, wa_version: ENV_WA_VERSION };
     }
@@ -1570,7 +1810,7 @@ app.get("/kirimpesan/media/:id", async (req, res) => {
     if (!ctx.wa_token) return res.status(500).send("WA_TOKEN belum tersedia");
 
     // 1) Ambil metadata media (url + mime_type)
-    const metaUrl = `https://graph.facebook.com/${ctx.wa_version}/${mediaId}`;
+    const metaUrl = `https://graph.facebook.com/${ctx.wa_version || ENV_WA_VERSION}/${mediaId}`;
     const metaResp = await axios.get(metaUrl, {
       headers: { Authorization: `Bearer ${ctx.wa_token}` },
     });
@@ -1594,6 +1834,7 @@ app.get("/kirimpesan/media/:id", async (req, res) => {
 });
 
 // ====== START SERVER ======
+
 app.listen(PORT, () => {
   console.log("WA Broadcast API running on port", PORT);
 });
