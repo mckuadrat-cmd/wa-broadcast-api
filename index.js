@@ -5,6 +5,9 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 
+const multer = require("multer");
+const FormData = require("form-data");
+
 const app = express();
 
 const bcrypt = require("bcryptjs");
@@ -35,6 +38,14 @@ const WABA_ID = process.env.WABA_ID; // ID WhatsApp Business Account
 const WA_TOKEN = process.env.WA_TOKEN; // Permanent token
 const WA_VERSION = process.env.WA_VERSION || "v24.0";
 const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
+
+// Upload file ke memory (bukan ke disk)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 15 * 1024 * 1024, // max 15 MB
+  },
+});
 
 // PHONE_NUMBER_ID default (kalau tidak dipilih dari dropdown di frontend)
 const DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
@@ -304,11 +315,94 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
     });
   }
 });
+// =======================================================
+// POST /kirimpesan/templates/upload-sample
+// Upload 1 file ke Meta → balikkan media_id (header_handle)
+// body: multipart/form-data { file }
+// =======================================================
+app.post(
+  "/kirimpesan/templates/upload-sample",
+  authMiddleware,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({
+          status: "error",
+          error: "File sample wajib diupload",
+        });
+      }
+
+      if (!WA_TOKEN) {
+        return res.status(500).json({
+          status: "error",
+          error: "WA_TOKEN belum diset di server",
+        });
+      }
+
+      // Cari phone_number_id untuk upload media
+      let phoneId = DEFAULT_PHONE_NUMBER_ID || null;
+
+      if (!phoneId) {
+        const phones = await getWabaPhoneNumbers();
+        if (!phones.length) {
+          return res.status(500).json({
+            status: "error",
+            error: "Tidak ada phone_number di WABA untuk upload media",
+          });
+        }
+        phoneId = phones[0].id;
+      }
+
+      const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/media`;
+
+      const form = new FormData();
+      form.append("file", req.file.buffer, {
+        filename: req.file.originalname,
+        contentType: req.file.mimetype,
+      });
+      form.append("messaging_product", "whatsapp");
+      if (req.file.mimetype) {
+        form.append("type", req.file.mimetype);
+      }
+
+      const resp = await axios.post(url, form, {
+        headers: {
+          Authorization: `Bearer ${WA_TOKEN}`,
+          ...form.getHeaders(),
+        },
+      });
+
+      const mediaId = resp.data?.id;
+      if (!mediaId) {
+        return res.status(500).json({
+          status: "error",
+          error: "Meta tidak mengembalikan media id",
+          raw: resp.data,
+        });
+      }
+
+      return res.json({
+        status: "ok",
+        media_id: mediaId,
+      });
+    } catch (err) {
+      console.error(
+        "Error /kirimpesan/templates/upload-sample:",
+        err.response?.data || err.message
+      );
+      res.status(500).json({
+        status: "error",
+        error: err.response?.data || err.message,
+      });
+    }
+  }
+);
 
 // =======================================================
 // 3) POST /kirimpesan/templates/create
 //    Ajukan template baru ke Meta
-//    Body JSON: { name, category, body_text, example_1, footer_text, buttons }
+//    Body JSON: { name, category, body_text, example_1, footer_text, buttons, media_sample, sample_media_id }
 // =======================================================
 app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   try {
@@ -320,6 +414,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       footer_text,
       buttons,
       media_sample,
+      sample_media_id,
     } = req.body || {};
 
     if (!name || !category || !body_text) {
@@ -336,19 +431,42 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       });
     }
 
+    // Kalau pilih media_sample tapi belum upload sample → tolak di sini
+    if (media_sample && media_sample !== "NONE") {
+      const fmt = String(media_sample).toUpperCase();
+      const butuhSample = ["IMAGE", "VIDEO", "DOCUMENT"].includes(fmt);
+      if (butuhSample && !sample_media_id) {
+        return res.status(400).json({
+          status: "error",
+          error: "Media sample dipilih, tapi file contoh belum diupload.",
+        });
+      }
+    }
+
     const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
 
-    // 🔧 SUSUN COMPONENTS DARI KOSONG
+    // SUSUN components
     const components = [];
 
     // 1) HEADER media (optional)
     if (media_sample && media_sample !== "NONE") {
-      const fmt = String(media_sample).toUpperCase(); // jaga-jaga
-      components.push({
+      const fmt = String(media_sample).toUpperCase();
+      const headerComp = {
         type: "HEADER",
         format: fmt, // "IMAGE" | "VIDEO" | "DOCUMENT" | "LOCATION"
-        // sementara tanpa example header_handle
-      });
+      };
+
+      // Kalau ada sample_media_id → jadikan example.header_handle
+      if (
+        sample_media_id &&
+        ["IMAGE", "VIDEO", "DOCUMENT"].includes(fmt)
+      ) {
+        headerComp.example = {
+          header_handle: [sample_media_id],
+        };
+      }
+
+      components.push(headerComp);
     }
 
     // 2) BODY (cukup sekali)
@@ -380,7 +498,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
     const payload = {
       name,
       category,
-      language: TEMPLATE_LANG, // <– pakai env
+      language: TEMPLATE_LANG,
       components,
     };
 
