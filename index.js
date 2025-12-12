@@ -409,14 +409,14 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   // ===============================
   // HEADER (MEDIA SAMPLE WAJIB)
   // ===============================
-  if (media_sample && media_sample !== "NONE") {
-    if (!handleId) {
-      return res.status(400).json({
-        status: "error",
-        error_message:
-          "Template dengan header media WAJIB upload sample file (media handle).",
-      });
-    }
+  if (media_sample !== "NONE") {
+    if (!handleId) return res.status(400)...
+    components.push({
+      type: "HEADER",
+      format: media_sample,
+      example: { header_handle: [handleId] }
+    });
+  }
   
     components.push({
       type: "HEADER",
