@@ -416,6 +416,56 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
   }
 });
 
+app.get("/kirimpesan/me", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+
+    const { rows } = await pgPool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.display_name_user,
+        u.role,
+        u.school_id,
+        COALESCE(u.phone_number_id, s.default_phone_number_id) AS effective_phone_number_id,
+        s.school_key,
+        s.display_name AS school_name,
+        s.default_phone_number_id
+      FROM users u
+      JOIN schools s ON s.id = u.school_id
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ status: "error", error: "User not found" });
+    }
+
+    const me = rows[0];
+
+    return res.json({
+      status: "ok",
+      me: {
+        id: me.id,
+        username: me.username,
+        displayName: me.display_name_user,
+        role: me.role,
+        schoolId: me.school_id,
+        schoolKey: me.school_key,
+        schoolName: me.school_name,
+        effectivePhoneNumberId: me.effective_phone_number_id,
+        schoolDefaultPhoneNumberId: me.default_phone_number_id,
+      },
+    });
+  } catch (err) {
+    console.error("Error /kirimpesan/me:", err);
+    return res.status(500).json({ status: "error", error: "Internal server error" });
+  }
+});
+
 // =======================================================
 // Helper: ambil metadata template (paramCount & language)
 // =======================================================
@@ -1397,6 +1447,7 @@ if (!followCtx.wa_token) {
 app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "50", 10);
+    const schoolId = req.user.school_id;
 
     const sql = `
       SELECT
@@ -1412,12 +1463,14 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
       FROM broadcasts b
       LEFT JOIN broadcast_recipients br ON br.broadcast_id = b.id
       LEFT JOIN broadcast_followups bf  ON bf.broadcast_id = b.id
+      WHERE b.school_id = $2
       GROUP BY b.id
       ORDER BY b.created_at DESC
       LIMIT $1
     `;
 
-    const { rows } = await pgPool.query(sql, [limit]);
+    const { rows } = await pgPool.query(sql, [limit, schoolId]);
+
     res.json({ status: "ok", count: rows.length, logs: rows });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/logs:", err);
@@ -1559,7 +1612,7 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
 // =======================================================
 // 10) KOTAK MASUK / INBOX
 // =======================================================
-app.get("/kirimpesan/inbox", async (req, res) => {
+app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "100", 10);
 
