@@ -8,6 +8,11 @@ const axios = require("axios");
 const multer = require("multer");
 const FormData = require("form-data");
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB cukup aman utk sample
+});
+
 const app = express();
 
 const bcrypt = require("bcryptjs");
@@ -316,9 +321,9 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
   }
 });
 // =======================================================
+// UPLOAD SAMPLE MEDIA (untuk template header)
 // POST /kirimpesan/templates/upload-sample
-// Upload 1 file ke Meta → balikkan media_id (header_handle)
-// body: multipart/form-data { file }
+// multipart/form-data: file, phone_number_id(optional), mime_type(optional)
 // =======================================================
 app.post(
   "/kirimpesan/templates/upload-sample",
@@ -326,74 +331,58 @@ app.post(
   upload.single("file"),
   async (req, res) => {
     try {
-      if (!req.file) {
-        return res.status(400).json({
-          status: "error",
-          error: "File sample wajib diupload",
-        });
-      }
-
-      if (!WA_TOKEN) {
-        return res.status(500).json({
-          status: "error",
-          error: "WA_TOKEN belum diset di server",
-        });
-      }
-
-      // Cari phone_number_id untuk upload media
-      let phoneId = DEFAULT_PHONE_NUMBER_ID || null;
-
+      const phoneId = req.body.phone_number_id || DEFAULT_PHONE_NUMBER_ID;
       if (!phoneId) {
-        const phones = await getWabaPhoneNumbers();
-        if (!phones.length) {
-          return res.status(500).json({
-            status: "error",
-            error: "Tidak ada phone_number di WABA untuk upload media",
-          });
-        }
-        phoneId = phones[0].id;
+        return res.status(400).json({ status: "error", error: "PHONE_NUMBER_ID belum ada" });
+      }
+      if (!req.file) {
+        return res.status(400).json({ status: "error", error: "file wajib diupload" });
       }
 
+      // WA Cloud API media upload:
+      // POST https://graph.facebook.com/vXX.X/{phone-number-id}/media
       const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/media`;
 
       const form = new FormData();
-      form.append("file", req.file.buffer, {
-        filename: req.file.originalname,
-        contentType: req.file.mimetype,
-      });
       form.append("messaging_product", "whatsapp");
-      if (req.file.mimetype) {
-        form.append("type", req.file.mimetype);
-      }
+
+      // Meta butuh "type" (mime)
+      const mimeType =
+        req.file.mimetype || req.body.mime_type || "application/pdf";
+      form.append("type", mimeType);
+
+      form.append("file", req.file.buffer, {
+        filename: req.file.originalname || "sample",
+        contentType: mimeType,
+      });
 
       const resp = await axios.post(url, form, {
         headers: {
           Authorization: `Bearer ${WA_TOKEN}`,
           ...form.getHeaders(),
         },
+        maxBodyLength: Infinity,
       });
 
-      const mediaId = resp.data?.id;
-      if (!mediaId) {
-        return res.status(500).json({
-          status: "error",
-          error: "Meta tidak mengembalikan media id",
-          raw: resp.data,
-        });
-      }
-
+      // resp.data biasanya: { id: "MEDIA_ID" }
       return res.json({
         status: "ok",
-        media_id: mediaId,
+        media_id: resp.data?.id || null,
+        mime_type: mimeType,
+        filename: req.file.originalname || null,
       });
     } catch (err) {
-      console.error(
-        "Error /kirimpesan/templates/upload-sample:",
-        err.response?.data || err.message
-      );
-      res.status(500).json({
+      const meta = err.response?.data;
+      console.error("Error upload-sample:", meta || err.message);
+
+      let message = err.message || "Gagal upload sample";
+      if (meta?.error?.error_user_msg) message = meta.error.error_user_msg;
+      else if (meta?.error?.message) message = meta.error.message;
+
+      return res.status(err.response?.status || 500).json({
         status: "error",
-        error: err.response?.data || err.message,
+        error_message: message,
+        error_raw: meta || err.message,
       });
     }
   }
@@ -406,101 +395,64 @@ app.post(
 // =======================================================
 app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   try {
-    const {
-      name,
-      category,
-      body_text,
-      example_1,
-      footer_text,
-      buttons,
-      media_sample,
-      sample_media_id,
-    } = req.body || {};
-
-    if (!name || !category || !body_text) {
+  const {
+    name,
+    category,
+    body_text,
+    example_1,
+    footer_text,
+    buttons,
+    media_sample,      // "DOCUMENT" | "IMAGE" | "VIDEO" | "NONE"
+    media_handle_id,   // hasil dari upload-sample (media_id)
+  } = req.body || {};
+  
+  const components = [];
+  
+  // 1) HEADER media (optional) + wajib example handle kalau pakai media
+  if (media_sample && media_sample !== "NONE") {
+    if (!media_handle_id) {
       return res.status(400).json({
         status: "error",
-        error: "name, category, body_text wajib diisi",
+        error_message:
+          `Template header ${media_sample} butuh sample. Upload dulu lalu kirim media_handle_id.`,
       });
     }
-
-    if (!WABA_ID || !WA_TOKEN) {
-      return res.status(500).json({
-        status: "error",
-        error: "WABA_ID atau WA_TOKEN belum diset di server",
-      });
-    }
-
-    // Kalau pilih media_sample tapi belum upload sample → tolak di sini
-    if (media_sample && media_sample !== "NONE") {
-      const fmt = String(media_sample).toUpperCase();
-      const butuhSample = ["IMAGE", "VIDEO", "DOCUMENT"].includes(fmt);
-      if (butuhSample && !sample_media_id) {
-        return res.status(400).json({
-          status: "error",
-          error: "Media sample dipilih, tapi file contoh belum diupload.",
-        });
-      }
-    }
-
-    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
-
-    // SUSUN components
-    const components = [];
-
-    // 1) HEADER media (optional)
-    if (media_sample && media_sample !== "NONE") {
-      const fmt = String(media_sample).toUpperCase();
-      const headerComp = {
-        type: "HEADER",
-        format: fmt, // "IMAGE" | "VIDEO" | "DOCUMENT" | "LOCATION"
-      };
-
-      // Kalau ada sample_media_id → jadikan example.header_handle
-      if (
-        sample_media_id &&
-        ["IMAGE", "VIDEO", "DOCUMENT"].includes(fmt)
-      ) {
-        headerComp.example = {
-          header_handle: [sample_media_id],
-        };
-      }
-
-      components.push(headerComp);
-    }
-
-    // 2) BODY (cukup sekali)
+  
     components.push({
-      type: "BODY",
-      text: body_text,
-      ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
+      type: "HEADER",
+      format: media_sample, // "DOCUMENT" | "IMAGE" | "VIDEO"
+      example: {
+        header_handle: [media_handle_id],
+      },
     });
-
-    // 3) FOOTER (opsional)
-    if (footer_text) {
-      components.push({
-        type: "FOOTER",
-        text: footer_text,
-      });
-    }
-
-    // 4) BUTTONS (opsional)
-    if (Array.isArray(buttons) && buttons.length) {
-      components.push({
-        type: "BUTTONS",
-        buttons: buttons.map((label) => ({
-          type: "QUICK_REPLY",
-          text: label,
-        })),
-      });
-    }
-
-    const payload = {
-      name,
-      category,
-      language: TEMPLATE_LANG,
-      components,
-    };
+  }
+  
+  // 2) BODY
+  components.push({
+    type: "BODY",
+    text: body_text,
+    ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
+  });
+  
+  // 3) FOOTER
+  if (footer_text) {
+    components.push({ type: "FOOTER", text: footer_text });
+  }
+  
+  // 4) BUTTONS
+  if (Array.isArray(buttons) && buttons.length) {
+    components.push({
+      type: "BUTTONS",
+      buttons: buttons.map((label) => ({ type: "QUICK_REPLY", text: label })),
+    });
+  }
+  
+  const payload = {
+    name,
+    category,
+    language: TEMPLATE_LANG,
+    components,
+  };
 
     const resp = await axios.post(url, payload, {
       headers: {
