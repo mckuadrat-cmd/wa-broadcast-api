@@ -338,31 +338,27 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
 
     const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
 
-    const components = [
-      {
-        type: "BODY",
-        text: body_text,
-        ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
-      },
-    ];
+    // 🔧 SUSUN COMPONENTS DARI KOSONG
+    const components = [];
 
-    // HEADER media (optional)
+    // 1) HEADER media (optional)
     if (media_sample && media_sample !== "NONE") {
+      const fmt = String(media_sample).toUpperCase(); // jaga-jaga
       components.push({
         type: "HEADER",
-        format: media_sample, // "IMAGE" | "VIDEO" | "DOCUMENT" | "LOCATION"
-        // contoh paling simpel, tanpa variable & tanpa sample handle dulu
+        format: fmt, // "IMAGE" | "VIDEO" | "DOCUMENT" | "LOCATION"
+        // sementara tanpa example header_handle
       });
     }
 
-    // BODY
+    // 2) BODY (cukup sekali)
     components.push({
       type: "BODY",
       text: body_text,
-      // kalau mau pakai example_1 → masukkan ke "example"
+      ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
     });
 
-    // FOOTER (opsional)
+    // 3) FOOTER (opsional)
     if (footer_text) {
       components.push({
         type: "FOOTER",
@@ -370,7 +366,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       });
     }
 
-    // BUTTONS (kalau ada)
+    // 4) BUTTONS (opsional)
     if (Array.isArray(buttons) && buttons.length) {
       components.push({
         type: "BUTTONS",
@@ -406,21 +402,18 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       meta || err.message
     );
 
-    // Ambil pesan paling enak dibaca dari Meta
     let message = err.message || "Gagal membuat template";
 
     if (meta?.error?.error_user_msg) {
-      // biasanya ini yang muncul di UI WhatsApp Manager
       message = meta.error.error_user_msg;
     } else if (meta?.error?.message) {
-      // fallback: pesan umum Graph API
       message = meta.error.message;
     }
 
     res.status(err.response?.status || 500).json({
       status: "error",
-      error_message: message, // ← dipakai frontend
-      error_raw: meta || err.message, // ← buat debug/log saja
+      error_message: message,
+      error_raw: meta || err.message,
     });
   }
 });
