@@ -14,6 +14,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET || "GANTI_SECRET_INI_DI_ENV";
+const META_APP_ID = process.env.META_APP_ID;
 
 process.on("uncaughtException", (err) => {
   console.error("🔥 UNCAUGHT ERROR:", err);
@@ -315,10 +316,12 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
     });
   }
 });
+
 // =======================================================
-// UPLOAD SAMPLE MEDIA (untuk template header)
+// UPLOAD SAMPLE MEDIA HANDLE (RESUMABLE) - untuk template header
 // POST /kirimpesan/templates/upload-sample
-// multipart/form-data: file, phone_number_id(optional), mime_type(optional)
+// multipart/form-data: file
+// return: { handle: "<ASSET_HANDLE>" }
 // =======================================================
 app.post(
   "/kirimpesan/templates/upload-sample",
@@ -326,57 +329,89 @@ app.post(
   upload.single("file"),
   async (req, res) => {
     try {
-      const phoneId = req.body.phone_number_id || DEFAULT_PHONE_NUMBER_ID;
-      if (!phoneId) {
-        return res.status(400).json({ status: "error", error: "PHONE_NUMBER_ID belum ada" });
+      if (!META_APP_ID) {
+        return res.status(500).json({
+          status: "error",
+          error: "META_APP_ID belum diset di server",
+        });
+      }
+      if (!WA_TOKEN) {
+        return res.status(500).json({
+          status: "error",
+          error: "WA_TOKEN belum diset di server",
+        });
       }
       if (!req.file) {
-        return res.status(400).json({ status: "error", error: "file wajib diupload" });
+        return res.status(400).json({
+          status: "error",
+          error: "file wajib diupload",
+        });
       }
 
-      // WA Cloud API media upload:
-      // POST https://graph.facebook.com/vXX.X/{phone-number-id}/media
-      const url = `https://graph.facebook.com/${WA_VERSION}/${phoneId}/media`;
+      const mimeType = req.file.mimetype || "application/pdf";
+      const fileName = req.file.originalname || "sample";
+      const fileLength = req.file.size;
 
-      const form = new FormData();
-      form.append("messaging_product", "whatsapp");
+      // 1) Create upload session (Resumable Upload API)
+      const createSessionUrl = `https://graph.facebook.com/${WA_VERSION}/${META_APP_ID}/uploads`;
 
-      // Meta butuh "type" (mime)
-      const mimeType =
-        req.file.mimetype || req.body.mime_type || "application/pdf";
-      form.append("type", mimeType);
+      const sessResp = await axios.post(
+        createSessionUrl,
+        null,
+        {
+          params: {
+            file_name: fileName,
+            file_length: fileLength,
+            file_type: mimeType,
+          },
+          headers: { Authorization: `Bearer ${WA_TOKEN}` },
+        }
+      );
 
-      form.append("file", req.file.buffer, {
-        filename: req.file.originalname || "sample",
-        contentType: mimeType,
-      });
+      const uploadSessionId = sessResp.data?.id;
+      if (!uploadSessionId) {
+        return res.status(500).json({
+          status: "error",
+          error: "Gagal membuat upload session",
+          error_raw: sessResp.data || null,
+        });
+      }
 
-      const resp = await axios.post(url, form, {
+      // 2) Upload bytes ke session id → dapat "h" (handle)
+      const uploadUrl = `https://graph.facebook.com/${WA_VERSION}/${uploadSessionId}`;
+
+      const upResp = await axios.post(uploadUrl, req.file.buffer, {
         headers: {
           Authorization: `Bearer ${WA_TOKEN}`,
-          ...form.getHeaders(),
+          "Content-Type": mimeType,
+          "file_offset": "0",
         },
         maxBodyLength: Infinity,
       });
 
-      // resp.data biasanya: { id: "MEDIA_ID" }
+      const handle = upResp.data?.h; // <-- INI yang dipakai jadi header_handle
+      if (!handle) {
+        return res.status(500).json({
+          status: "error",
+          error: "Upload selesai tapi handle tidak ditemukan",
+          error_raw: upResp.data || null,
+        });
+      }
+
       return res.json({
         status: "ok",
-        media_id: resp.data?.id || null,
+        handle,
         mime_type: mimeType,
-        filename: req.file.originalname || null,
+        filename: fileName,
+        size: fileLength,
       });
     } catch (err) {
       const meta = err.response?.data;
-      console.error("Error upload-sample:", meta || err.message);
-
-      let message = err.message || "Gagal upload sample";
-      if (meta?.error?.error_user_msg) message = meta.error.error_user_msg;
-      else if (meta?.error?.message) message = meta.error.message;
+      console.error("Error upload-sample(handle):", meta || err.message);
 
       return res.status(err.response?.status || 500).json({
         status: "error",
-        error_message: message,
+        error_message: meta?.error?.message || err.message,
         error_raw: meta || err.message,
       });
     }
