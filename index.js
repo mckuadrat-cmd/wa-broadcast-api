@@ -407,44 +407,41 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   const components = [];
 
   // ===============================
-  // HEADER (MEDIA SAMPLE WAJIB)
+  // HEADER (MEDIA SAMPLE OPSIONAL)
   // ===============================
-  if (media_sample !== "NONE") {
-    if (!handleId) return res.status(400)...
-    components.push({
-      type: "HEADER",
-      format: media_sample,
-      example: { header_handle: [handleId] }
-    });
-  }
+  if (media_sample && media_sample !== "NONE") {
+    if (!handleId) {
+      return res.status(400).json({
+        status: "error",
+        error: "media_handle_id / sample_media_id wajib diisi jika media_sample bukan NONE",
+      });
+    }
   
     components.push({
       type: "HEADER",
       format: media_sample, // DOCUMENT | IMAGE | VIDEO
-      example: {
-        header_handle: [handleId], // ⬅️ INI WAJIB
-      },
+      example: { header_handle: [handleId] },
     });
   }
   
-  // ===============================
-  // BODY (WAJIB)
-  // ===============================
-  components.push({
-    type: "BODY",
-    text: body_text,
-    ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
-  });
-  
-  // ===============================
-  // FOOTER (OPSIONAL)
-  // ===============================
-  if (footer_text) {
+    // ===============================
+    // BODY (WAJIB)
+    // ===============================
     components.push({
-      type: "FOOTER",
-      text: footer_text,
+      type: "BODY",
+      text: body_text,
+      ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
     });
-  }
+    
+    // ===============================
+    // FOOTER (OPSIONAL)
+    // ===============================
+    if (footer_text) {
+      components.push({
+        type: "FOOTER",
+        text: footer_text,
+      });
+    }
   
   // ===============================
   // BUTTONS (OPSIONAL)
