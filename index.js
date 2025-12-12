@@ -1052,6 +1052,7 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const msg = messages[0];
     const from = msg.from; // nomor pengirim (628xx…)
     let triggerText = "";
+    const phoneNumberId = value.metadata?.phone_number_id || null;
 
     // Ambil teks yang dikirim user (button / interactive / text biasa)
     if (msg.type === "text" && msg.text) {
@@ -1093,32 +1094,35 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       const isQuickReply =
         !!triggerText && (msg.type === "button" || msg.type === "interactive");
 
-      await pgPool.query(
-        `INSERT INTO inbox_messages
-             (phone,
-              message_type,
-              message_text,
-              raw_json,
-              broadcast_id,
-              is_quick_reply,
-              media_type,
-              media_id,
-              media_filename,
-              media_caption)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [
-          from,
-          msg.type || null,
-          triggerText || null,
-          JSON.stringify(req.body || {}),
-          broadcastId || null,
-          isQuickReply,
-          mediaType,
-          mediaId,
-          mediaFilename,
-          mediaCaption,
-        ]
-      );
+    await pgPool.query(
+      `INSERT INTO inbox_messages
+         (phone,
+          message_type,
+          message_text,
+          raw_json,
+          broadcast_id,
+          is_quick_reply,
+          media_type,
+          media_id,
+          media_filename,
+          media_caption,
+          phone_number_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        from,
+        msg.type || null,
+        triggerText || null,
+        JSON.stringify(req.body || {}),
+        broadcastId || null,
+        isQuickReply,
+        mediaType,
+        mediaId,
+        mediaFilename,
+        mediaCaption,
+        phoneNumberId,       // ⬅️ nomor pengirim WABA
+      ]
+    );
+
     } catch (e) {
       console.error("Insert inbox_messages error:", e);
     }
@@ -1455,9 +1459,12 @@ app.get(
 // 10) KOTAK MASUK / INBOX (gabung dengan data broadcast)
 //     GET /kirimpesan/inbox?limit=50
 // =======================================================
-app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
+app.get("/kirimpesan/inbox", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "100", 10);
+
+    const phoneNumberId =
+      req.query.phone_number_id || DEFAULT_PHONE_NUMBER_ID || null;
 
     const sql = `
       SELECT
@@ -1472,6 +1479,7 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
         im.media_id,
         im.media_filename,
         im.media_caption,
+        im.phone_number_id,
         b.template_name,
         br.vars_json
       FROM inbox_messages im
@@ -1480,20 +1488,20 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
        AND br.phone        = im.phone
       LEFT JOIN broadcasts b
         ON b.id = im.broadcast_id
+      WHERE ($2::text IS NULL OR im.phone_number_id = $2)
       ORDER BY im.at DESC
       LIMIT $1
     `;
 
-    const { rows } = await pgPool.query(sql, [limit]);
+    const { rows } = await pgPool.query(sql, [limit, phoneNumberId]);
 
     res.json({
       status: "ok",
-      count: rows.length,
       messages: rows,
     });
   } catch (err) {
-    console.error("Error /kirimpesan/inbox:", err);
-    res.status(500).json({ status: "error", error: String(err) });
+    console.error("Inbox error:", err);
+    res.status(500).json({ status: "error", error: "Gagal memuat inbox" });
   }
 });
 
