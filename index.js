@@ -8,11 +8,6 @@ const axios = require("axios");
 const multer = require("multer");
 const FormData = require("form-data");
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB cukup aman utk sample
-});
-
 const app = express();
 
 const bcrypt = require("bcryptjs");
@@ -404,46 +399,63 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
     buttons,
     media_sample,      // "DOCUMENT" | "IMAGE" | "VIDEO" | "NONE"
     media_handle_id,   // hasil dari upload-sample (media_id)
+    sample_media_id,
   } = req.body || {};
+    
+  const handleId = media_handle_id || sample_media_id;
   
   const components = [];
-  
-  // 1) HEADER media (optional) + wajib example handle kalau pakai media
+
+  // ===============================
+  // HEADER (MEDIA SAMPLE WAJIB)
+  // ===============================
   if (media_sample && media_sample !== "NONE") {
-    if (!media_handle_id) {
+    if (!handleId) {
       return res.status(400).json({
         status: "error",
         error_message:
-          `Template header ${media_sample} butuh sample. Upload dulu lalu kirim media_handle_id.`,
+          "Template dengan header media WAJIB upload sample file (media handle).",
       });
     }
   
     components.push({
       type: "HEADER",
-      format: media_sample, // "DOCUMENT" | "IMAGE" | "VIDEO"
+      format: media_sample, // DOCUMENT | IMAGE | VIDEO
       example: {
-        header_handle: [media_handle_id],
+        header_handle: [handleId], // ⬅️ INI WAJIB
       },
     });
   }
   
-  // 2) BODY
+  // ===============================
+  // BODY (WAJIB)
+  // ===============================
   components.push({
     type: "BODY",
     text: body_text,
     ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
   });
   
-  // 3) FOOTER
+  // ===============================
+  // FOOTER (OPSIONAL)
+  // ===============================
   if (footer_text) {
-    components.push({ type: "FOOTER", text: footer_text });
+    components.push({
+      type: "FOOTER",
+      text: footer_text,
+    });
   }
   
-  // 4) BUTTONS
+  // ===============================
+  // BUTTONS (OPSIONAL)
+  // ===============================
   if (Array.isArray(buttons) && buttons.length) {
     components.push({
       type: "BUTTONS",
-      buttons: buttons.map((label) => ({ type: "QUICK_REPLY", text: label })),
+      buttons: buttons.map((label) => ({
+        type: "QUICK_REPLY",
+        text: label,
+      })),
     });
   }
   
@@ -453,7 +465,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
     language: TEMPLATE_LANG,
     components,
   };
-
+    const url = `https://graph.facebook.com/${WA_VERSION}/${WABA_ID}/message_templates`;
     const resp = await axios.post(url, payload, {
       headers: {
         Authorization: `Bearer ${WA_TOKEN}`,
