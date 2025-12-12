@@ -427,7 +427,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
 
 // =======================================================
 // 4) Helper: kirim 1 WA template
-//    arg: { phone, templateName, vars, phone_number_id }
+//    arg: { phone, templateName, templateLanguage, vars, phone_number_id, headerDocument }
 // =======================================================
 async function sendWaTemplate({
   phone,
@@ -435,6 +435,7 @@ async function sendWaTemplate({
   templateLanguage,
   vars,
   phone_number_id,
+  headerDocument,   // 👈 tambahan: boleh null
 }) {
   const phoneId = phone_number_id || DEFAULT_PHONE_NUMBER_ID;
   if (!phoneId) {
@@ -445,6 +446,40 @@ async function sendWaTemplate({
 
   const langCode = templateLanguage || "en"; // fallback kalau metadata gagal
 
+  // --- susun components dinamis: HEADER (opsional) + BODY ---
+  const components = [];
+
+  // 1) HEADER document (kalau ada follow_media)
+  if (headerDocument && headerDocument.link) {
+    let filename = (headerDocument.filename || "").trim();
+    if (!filename) filename = "document.pdf";
+    if (!filename.toLowerCase().endsWith(".pdf")) {
+      filename += ".pdf";
+    }
+
+    components.push({
+      type: "header",
+      parameters: [
+        {
+          type: "document",
+          document: {
+            link: headerDocument.link,
+            filename,
+          },
+        },
+      ],
+    });
+  }
+
+  // 2) BODY (tetap sama seperti sebelumnya)
+  components.push({
+    type: "body",
+    parameters: (vars && vars.length > 0 ? vars : [""]).map((v) => ({
+      type: "text",
+      text: String(v ?? ""),
+    })),
+  });
+
   const body = {
     messaging_product: "whatsapp",
     to: phone,
@@ -452,15 +487,7 @@ async function sendWaTemplate({
     template: {
       name: templateName,
       language: { code: langCode },
-      components: [
-        {
-          type: "body",
-          parameters: (vars && vars.length > 0 ? vars : [""]).map((v) => ({
-            type: "text",
-            text: String(v ?? ""),
-          })),
-        },
-      ],
+      components,
     },
   };
 
@@ -767,16 +794,25 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
       const followMedia = row.follow_media || null;
       const followMediaFilename = row.follow_media_filename || null;
-
+      
+      // Siapkan headerDocument untuk template
+      const headerDocument = followMedia
+        ? {
+            link: followMedia,
+            filename: followMediaFilename || null,
+          }
+        : null;
+      
       try {
         const r = await sendWaTemplate({
           phone,
           templateName: template_name,
-          templateLanguage: language, // <– otomatis ikut template
+          templateLanguage: language,   // <– otomatis ikut template
           vars: varsForTemplate,
           phone_number_id: effectivePhoneId,
+          headerDocument,               // 👈 tambahan penting
         });
-
+  
         results.push(r);
 
         await pgPool.query(
@@ -1550,7 +1586,15 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           row: rowForMap,
           broadcastId: bc.id,
         };
-
+        
+        // 👉 ambil media dari DB untuk header document
+        const headerDocument = rcp.follow_media
+          ? {
+              link: rcp.follow_media,
+              filename: rcp.follow_media_filename || null,
+            }
+          : null;
+        
         try {
           const r = await sendWaTemplate({
             phone,
@@ -1558,6 +1602,7 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
             templateLanguage: language,
             vars: varsForTemplate,
             phone_number_id: bc.phone_number_id || undefined,
+            headerDocument,   // 👈 tambahan
           });
 
           okCount++;
