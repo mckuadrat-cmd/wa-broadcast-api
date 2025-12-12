@@ -398,13 +398,14 @@ app.post(
         });
       }
 
-      return res.json({
-        status: "ok",
-        handle,
-        mime_type: mimeType,
-        filename: fileName,
-        size: fileLength,
-      });
+    return res.json({
+      status: "ok",
+      handle,
+      media_id: handle, // alias biar FE lama gak rusak
+      mime_type: mimeType,
+      filename: fileName,
+      size: fileLength,
+    });
     } catch (err) {
       const meta = err.response?.data;
       console.error("Error upload-sample(handle):", meta || err.message);
