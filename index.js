@@ -416,6 +416,11 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
   }
 });
 
+
+// =======================================================
+// ME (profile + effective sender)
+// GET /kirimpesan/me
+// =======================================================
 app.get("/kirimpesan/me", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -1442,7 +1447,7 @@ if (!followCtx.wa_token) {
 });
 
 // =======================================================
-// 9) LOG BROADCAST (POSTGRES)
+// 9) LOG BROADCAST (POSTGRES) — SCOPED by school_id
 // =======================================================
 app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
@@ -1470,7 +1475,6 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
     `;
 
     const { rows } = await pgPool.query(sql, [limit, schoolId]);
-
     res.json({ status: "ok", count: rows.length, logs: rows });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/logs:", err);
@@ -1480,8 +1484,12 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 
 app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
   const id = req.params.id;
+  const schoolId = req.user.school_id;
   try {
-    const bRes = await pgPool.query("SELECT * FROM broadcasts WHERE id = $1", [id]);
+    const bRes = await pgPool.query(
+      "SELECT * FROM broadcasts WHERE id = $1 AND school_id = $2",
+      [id, schoolId]
+    );
     if (!bRes.rows.length) {
       return res.status(404).json({ status: "error", error: "Log not found" });
     }
@@ -1507,11 +1515,15 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// Export CSV (tetap sama — tidak butuh token)
+// Export CSV (scoped by school_id)
 app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) => {
   const id = req.params.id;
+  const schoolId = req.user.school_id;
   try {
-    const bRes = await pgPool.query("SELECT * FROM broadcasts WHERE id = $1", [id]);
+    const bRes = await pgPool.query(
+      "SELECT * FROM broadcasts WHERE id = $1 AND school_id = $2",
+      [id, schoolId]
+    );
     if (!bRes.rows.length) return res.status(404).send("Log not found");
 
     const rRes = await pgPool.query(
@@ -1529,6 +1541,7 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
       followupMap[String(f.phone)] = f;
     });
 
+    // cari var terbanyak supaya header konsisten
     let maxVar = 0;
     recipients.forEach((row) => {
       const vars = row.vars_json || {};
@@ -1542,7 +1555,9 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
     });
 
     const headers = ["phone"];
-    for (let i = 1; i <= maxVar; i++) headers.push(`var${i}`);
+    for (let i = 1; i <= maxVar; i++) {
+      headers.push(`var${i}`);
+    }
     headers.push(
       "follow_media",
       "follow_media_filename",
@@ -1580,7 +1595,9 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
       cols.push(`"${String(followMediaFilename).replace(/"/g, '""')}"`);
 
       cols.push(row.template_ok ? "1" : "0");
-      cols.push(row.template_http_status != null ? String(row.template_http_status) : "");
+      cols.push(
+        row.template_http_status != null ? String(row.template_http_status) : ""
+      );
 
       const errStr =
         typeof row.template_error === "string"
@@ -1601,7 +1618,10 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
     const csv = lines.join("\n");
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="broadcast-${id}.csv"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="broadcast-${id}.csv"`
+    );
     res.send(csv);
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/logs/:id/csv:", err);
@@ -1610,13 +1630,15 @@ app.get("/kirimpesan/broadcast/logs/:id/csv", authMiddleware, async (req, res) =
 });
 
 // =======================================================
-// 10) KOTAK MASUK / INBOX
+// 10) KOTAK MASUK / INBOX (SCOPED by school)
 // =======================================================
 app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit || "100", 10);
+    const schoolId = req.user.school_id;
 
-    const phoneNumberId = req.query.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID || null;
+    // optional: filter hanya 1 phone_number_id (harus milik sekolah tsb)
+    const phoneNumberId = req.query.phone_number_id ? String(req.query.phone_number_id) : null;
 
     const sql = `
       SELECT
@@ -1640,13 +1662,17 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
        AND br.phone        = im.phone
       LEFT JOIN broadcasts b
         ON b.id = im.broadcast_id
-      WHERE ($2::text IS NULL OR im.phone_number_id = $2)
+      WHERE im.phone_number_id IN (
+        SELECT phone_number_id
+        FROM school_phone_numbers
+        WHERE school_id = $2
+      )
+        AND ($3::text IS NULL OR im.phone_number_id = $3)
       ORDER BY im.at DESC
       LIMIT $1
     `;
 
-    const { rows } = await pgPool.query(sql, [limit, phoneNumberId]);
-
+    const { rows } = await pgPool.query(sql, [limit, schoolId, phoneNumberId]);
     res.json({ status: "ok", messages: rows });
   } catch (err) {
     console.error("Inbox error:", err);
