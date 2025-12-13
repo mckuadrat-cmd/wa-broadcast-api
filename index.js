@@ -59,10 +59,7 @@ const WEBHOOK_VERIFY_TOKEN =
 // PORT Railway otomatis pakai process.env.PORT
 const PORT = process.env.PORT || 3000;
 
-// Menyimpan konfigurasi follow-up terakhir dari frontend
-let lastFollowupConfig = null;
-// Menyimpan mapping nomor → row broadcast terakhir (untuk var & attachment per-orang)
-let lastBroadcastRowsByPhone = {};
+CRON_SECRET=RANDOM_STRING_PANJANG
 
 // ====== MIDDLEWARE ======
 app.use(cors());
@@ -772,6 +769,13 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       });
     }
 
+    if (!body_text || !String(body_text).trim()) {
+      return res.status(400).json({
+        status: "error",
+        error: "body_text tidak boleh kosong"
+      });
+    }
+
     const payload = {
       name,
       category,
@@ -964,19 +968,16 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     const { paramCount, language } = await getTemplateMetadata(ctx, template_name);
 
     // --- cek apakah ini broadcast terjadwal? ---
-    const JAKARTA_OFFSET_MIN = 7 * 60; // +07:00
-    function parseJakartaLocalToUtc(str) {
-      const dLocal = new Date(str);
-      if (isNaN(dLocal.getTime())) return null;
-      const utcMs = dLocal.getTime() - JAKARTA_OFFSET_MIN * 60 * 1000;
-      return new Date(utcMs);
+    function parseScheduleISO(str) {
+      const d = new Date(str);
+      return isNaN(d.getTime()) ? null : d;
     }
 
     let scheduledDate = null;
     let isScheduled = false;
 
     if (scheduled_at) {
-      const dUtc = parseJakartaLocalToUtc(scheduled_at);
+      const dUtc = parseScheduleISO(scheduled_at);
       if (dUtc) {
         scheduledDate = dUtc;
         if (dUtc.getTime() > Date.now() + 15 * 1000) isScheduled = true;
@@ -1009,8 +1010,8 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         const phones = await getWabaPhoneNumbers(ctx);
         const match = phones.find(
           (p) =>
-            String(p.display_phone_number).replace(/\s+/g, "") ===
-            String(sender_phone).replace(/\s+/g, "")
+          const norm = (s) => String(s||"").replace(/\D/g,"");
+          norm(p.display_phone_number) === norm(sender_phone)
         );
         if (match) effectivePhoneId = match.id;
         else console.warn("sender_phone tidak ditemukan di WABA:", sender_phone);
@@ -1028,7 +1029,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       `INSERT INTO broadcasts (
          id, created_at, scheduled_at, status,
          template_name, sender_phone, phone_number_id, followup_enabled,
-         school_id
+         school_id, followup_config
        ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8)`,
       [
         broadcastId,
@@ -1039,6 +1040,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         effectivePhoneId || null,
         !!(followup && followup.text),
         ctx.school_id || null,
+        followup ? JSON.stringify(followup) : null,
       ]
     );
 
@@ -1344,7 +1346,17 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
     console.log("Type:", msg.type, "from:", from, "text:", triggerText);
 
-    const mapEntry = lastBroadcastRowsByPhone[String(from)] || null;
+    const { rows } = await pgPool.query(
+      `SELECT b.id, b.followup_config
+       FROM broadcasts b
+       JOIN broadcast_recipients br ON br.broadcast_id = b.id
+       WHERE br.phone = $1
+       ORDER BY b.created_at DESC
+       LIMIT 1`,
+      [from]
+    );
+    
+    +const followupConfig = rows[0]?.followup_config || null;
     const row = mapEntry ? mapEntry.row : null;
     const broadcastId = mapEntry ? mapEntry.broadcastId : null;
 
@@ -1686,10 +1698,13 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
        AND br.phone        = im.phone
       LEFT JOIN broadcasts b
         ON b.id = im.broadcast_id
-      WHERE im.phone_number_id IN (
-        SELECT phone_number_id
-        FROM school_phone_numbers
-        WHERE school_id = $2
+      WHERE (
+        im.phone_number_id IN (
+          SELECT phone_number_id FROM school_phone_numbers WHERE school_id = $2
+        )
+        OR im.phone_number_id = (
+          SELECT default_phone_number_id FROM schools WHERE id = $2
+        )
       )
         AND ($3::text IS NULL OR im.phone_number_id = $3)
       ORDER BY im.at DESC
@@ -1708,6 +1723,10 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
 // 11) JALANKAN BROADCAST YANG DIJADWALKAN
 // =======================================================
 app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
+  const secret = req.headers["x-cron-secret"] || req.query.secret;
+  if (secret !== process.env.CRON_SECRET) {
+    return res.status(403).json({ status: "error", error: "Forbidden" });
+  }
   try {
     const { rows: broadcasts } = await pgPool.query(
       `SELECT *
