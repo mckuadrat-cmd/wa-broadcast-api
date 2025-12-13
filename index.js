@@ -882,6 +882,24 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
     if (!effectivePhoneId) effectivePhoneId = ctx.phone_number_id ? String(ctx.phone_number_id) : null;
 
+    // ===== BROADCAST LOCK (ANTI DOUBLE SEND) =====
+    const { rowCount } = await pgPool.query(
+      `
+      UPDATE broadcasts
+      SET status = 'sending'
+      WHERE id = $1
+        AND status IN ('draft', 'scheduled')
+      `,
+      [broadcastId]
+    );
+    
+    if (rowCount === 0) {
+      return res.status(409).json({
+        status: "error",
+        error: "Broadcast sedang diproses atau sudah dikirim",
+      });
+    }
+
     // simpan broadcast
     await pgPool.query(
       `INSERT INTO broadcasts (
@@ -1051,10 +1069,20 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
       console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
     }
 
+    await pgPool.query(
+      `UPDATE broadcasts SET status = 'sent' WHERE id = $1`,
+      [broadcastId]
+    );
+
     return res.json({ status: "ok", to, wa_response: waRes });
   } catch (err) {
     console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
     return res.status(500).json({ status: "error", error: err.response?.data || err.message });
+    await pgPool.query(
+    `UPDATE broadcasts SET status = 'failed' WHERE id = $1`,
+    [broadcastId]
+);
+
   }
 });
 
