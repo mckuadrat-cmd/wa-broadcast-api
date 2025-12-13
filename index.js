@@ -1332,6 +1332,10 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
     const schoolId = req.user.school_id;
     const phoneNumberId = req.query.phone_number_id ? String(req.query.phone_number_id) : null;
 
+    if (phoneNumberId) {
+      await assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId);
+    }
+
     const sql = `
       SELECT
         im.id,
