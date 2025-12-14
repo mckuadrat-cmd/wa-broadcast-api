@@ -405,6 +405,18 @@ function buildFilenameFromTemplate(filenameTpl, varsMap, fallbackFilename) {
   return "Lampiran.pdf";
 }
 
+async function getDisplayPhoneByPhoneNumberId(schoolId, phoneNumberId) {
+  if (!schoolId || !phoneNumberId) return null;
+  const { rows } = await pgPool.query(
+    `SELECT display_phone_number
+     FROM school_phone_numbers
+     WHERE school_id = $1 AND phone_number_id = $2
+     LIMIT 1`,
+    [schoolId, String(phoneNumberId)]
+  );
+  return rows[0]?.display_phone_number || null;
+}
+
 // =====================
 // SENDERS
 // =====================
@@ -882,25 +894,19 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
     if (!effectivePhoneId) effectivePhoneId = ctx.phone_number_id ? String(ctx.phone_number_id) : null;
 
-    // ===== BROADCAST LOCK (ANTI DOUBLE SEND) =====
-    const { rowCount } = await pgPool.query(
-      `
-      UPDATE broadcasts
-      SET status = 'sending'
-      WHERE id = $1
-        AND status IN ('draft', 'scheduled')
-      `,
-      [broadcastId]
-    );
+    // pastikan sender_phone terisi display_phone_number (biar History bener)
+    let effectiveSenderPhone = sender_phone ? String(sender_phone) : null;
     
-    if (rowCount === 0) {
-      return res.status(409).json({
-        status: "error",
-        error: "Broadcast sedang diproses atau sudah dikirim",
-      });
+    if (!effectiveSenderPhone && effectivePhoneId && ctx.school_id) {
+      const display = await getDisplayPhoneByPhoneNumberId(ctx.school_id, effectivePhoneId);
+      if (display) effectiveSenderPhone = display;
     }
 
-    // simpan broadcast
+
+    // ===== CREATE BROADCAST ROW (LOCK) =====
+    // status awal: scheduled / sending
+    const initialStatus = isScheduled ? "scheduled" : "sending";
+    
     await pgPool.query(
       `INSERT INTO broadcasts (
          id, created_at, scheduled_at, status,
@@ -910,9 +916,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       [
         broadcastId,
         scheduledDate,
-        isScheduled ? "scheduled" : "sent",
+        initialStatus,
         template_name,
-        sender_phone || null,
+        effectiveSenderPhone || null,
         effectivePhoneId || null,
         !!(followup && followup.text),
         ctx.school_id || null,
@@ -1038,6 +1044,10 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     const ok = results.filter((r) => r.ok).length;
     const failed = total - ok;
 
+    let finalStatus = "sent";
+    if (ok === 0 && failed > 0) finalStatus = "failed";
+    await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [broadcastId, finalStatus]);
+
     return res.json({ status: "ok", broadcast_id: broadcastId, template_name, count: total, ok, failed, results });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast:", err);
@@ -1049,10 +1059,14 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
   try {
     const ctx = await getCtxByUserId(req.user.sub);
-    const { to, text, media, phone_number_id } = req.body || {};
+    const { to, text, media, phone_number_id, broadcast_id } = req.body || {};
 
-    if (!to) return res.status(400).json({ status: "error", error: "`to` wajib diisi" });
-    if (!text && !media) return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
+    if (!to) {
+      return res.status(400).json({ status: "error", error: "`to` wajib diisi" });
+    }
+    if (!text && !media) {
+      return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
+    }
 
     const waRes = await sendCustomMessage(ctx, { to, text, media, phone_number_id });
 
@@ -1060,29 +1074,32 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
     try {
       await pgPool.query(
         `
-        INSERT INTO inbox_messages (at, phone, message_type, message_text, is_quick_reply, broadcast_id, raw_json)
-        VALUES (NOW(), $1, $2, $3, $4, $5, $6)
+        INSERT INTO inbox_messages
+          (at, phone, message_type, message_text, is_quick_reply, broadcast_id, raw_json, phone_number_id)
+        VALUES
+          (NOW(), $1, $2, $3, $4, $5, $6, $7)
         `,
-        [to, media ? "outgoing_media" : "outgoing", text || null, false, null, JSON.stringify(waRes || {})]
+        [
+          to,
+          media ? "outgoing_media" : "outgoing",
+          text || null,
+          false,
+          broadcast_id || null,                 // optional: kalau memang terkait broadcast tertentu
+          JSON.stringify(waRes || {}),
+          phone_number_id || ctx.phone_number_id || null, // biar ter-scope di inbox
+        ]
       );
     } catch (dbErr) {
       console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
     }
 
-    await pgPool.query(
-      `UPDATE broadcasts SET status = 'sent' WHERE id = $1`,
-      [broadcastId]
-    );
-
     return res.json({ status: "ok", to, wa_response: waRes });
   } catch (err) {
     console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
-    return res.status(500).json({ status: "error", error: err.response?.data || err.message });
-    await pgPool.query(
-    `UPDATE broadcasts SET status = 'failed' WHERE id = $1`,
-    [broadcastId]
-);
-
+    return res.status(500).json({
+      status: "error",
+      error: err.response?.data || err.message,
+    });
   }
 });
 
