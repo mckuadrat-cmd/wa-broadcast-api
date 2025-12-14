@@ -1288,36 +1288,63 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 // =====================
 // BROADCAST LOGS (SCOPED SCHOOL)
 // =====================
-app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
+// contoh: GET /broadcast/logs?limit=50
+app.get("/broadcast/logs", authMiddleware, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit || "50", 10);
-    const schoolId = req.user.school_id;
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
+    const schoolId = req.user.school_id; // sesuaikan dgn auth lo
 
-    const sql = `
+    const q = `
       SELECT
-        b.id,
-        b.created_at,
-        b.template_name,
-        b.sender_phone,
-        b.followup_enabled,
-        COUNT(br.id) AS total,
-        COALESCE(SUM(CASE WHEN br.template_ok = TRUE  THEN 1 ELSE 0 END),0) AS ok,
-        COALESCE(SUM(CASE WHEN br.template_ok = FALSE THEN 1 ELSE 0 END),0) AS failed,
-        COUNT(DISTINCT bf.id) AS followup_count
-      FROM broadcasts b
-      LEFT JOIN broadcast_recipients br ON br.broadcast_id = b.id
-      LEFT JOIN broadcast_followups bf  ON bf.broadcast_id = b.id
-      WHERE b.school_id = $2
-      GROUP BY b.id
-      ORDER BY b.created_at DESC
-      LIMIT $1
-    `;
+        bl.id,
+        bl.created_at,
+        bl.template_name,
+        bl.total,
+        bl.ok,
+        bl.failed,
+        bl.followup_count,
 
-    const { rows } = await pgPool.query(sql, [limit, schoolId]);
-    return res.json({ status: "ok", count: rows.length, logs: rows });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast/logs:", err);
-    return res.status(500).json({ status: "error", error: String(err) });
+        bl.phone_number_id,
+        bl.sender_phone,
+
+        spn.display_phone_number,
+        spn.verified_name
+      FROM broadcast_logs bl
+      LEFT JOIN school_phone_numbers spn
+        ON spn.school_id = bl.school_id
+       AND spn.phone_number_id = bl.phone_number_id
+      WHERE bl.school_id = $1
+      ORDER BY bl.created_at DESC
+      LIMIT $2
+    `;
+    const { rows } = await pool.query(q, [schoolId, limit]);
+
+    const logs = rows.map((r) => {
+      const label =
+        (r.verified_name && String(r.verified_name).trim()) ||
+        (r.display_phone_number && String(r.display_phone_number).trim()) ||
+        null;
+
+      return {
+        id: r.id,
+        created_at: r.created_at,
+        template_name: r.template_name,
+        total: r.total,
+        ok: r.ok,
+        failed: r.failed,
+        followup_count: r.followup_count,
+
+        phone_number_id: r.phone_number_id || null,
+        sender_phone: r.sender_phone || r.display_phone_number || null,
+
+        sender_label: label, // ✅ ini yang dipakai UI
+      };
+    });
+
+    res.json({ status: "ok", logs });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ status: "error", message: "Gagal memuat logs" });
   }
 });
 
