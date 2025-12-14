@@ -1288,36 +1288,47 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 // =====================
 // BROADCAST LOGS (SCOPED SCHOOL)
 // =====================
-// contoh: GET /broadcast/logs?limit=50
-app.get("/broadcast/logs", authMiddleware, async (req, res) => {
+// contoh: GET /kirimpesan/broadcast/logs?limit=50
+app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
-    const schoolId = req.user.school_id; // sesuaikan dgn auth lo
+    const schoolId = req.user.school_id;
 
     const q = `
       SELECT
-        bl.id,
-        bl.created_at,
-        bl.template_name,
-        bl.total,
-        bl.ok,
-        bl.failed,
-        bl.followup_count,
+        b.id,
+        b.created_at,
+        b.template_name,
 
-        bl.phone_number_id,
-        bl.sender_phone,
+        COUNT(br.id) AS total,
+        COUNT(br.id) FILTER (WHERE br.template_ok = TRUE)  AS ok,
+        COUNT(br.id) FILTER (WHERE br.template_ok = FALSE) AS failed,
+
+        COUNT(bf.id) AS followup_count,
+
+        b.phone_number_id,
+        b.sender_phone,
 
         spn.display_phone_number,
         spn.verified_name
-      FROM broadcast_logs bl
+      FROM broadcasts b
+      LEFT JOIN broadcast_recipients br
+        ON br.broadcast_id = b.id
+      LEFT JOIN broadcast_followups bf
+        ON bf.broadcast_id = b.id
       LEFT JOIN school_phone_numbers spn
-        ON spn.school_id = bl.school_id
-       AND spn.phone_number_id = bl.phone_number_id
-      WHERE bl.school_id = $1
-      ORDER BY bl.created_at DESC
+        ON spn.school_id = b.school_id
+       AND spn.phone_number_id = b.phone_number_id
+      WHERE b.school_id = $1
+      GROUP BY
+        b.id,
+        spn.display_phone_number,
+        spn.verified_name
+      ORDER BY b.created_at DESC
       LIMIT $2
     `;
-    const { rows } = await pool.query(q, [schoolId, limit]);
+
+    const { rows } = await pgPool.query(q, [schoolId, limit]);
 
     const logs = rows.map((r) => {
       const label =
@@ -1329,41 +1340,25 @@ app.get("/broadcast/logs", authMiddleware, async (req, res) => {
         id: r.id,
         created_at: r.created_at,
         template_name: r.template_name,
-        total: r.total,
-        ok: r.ok,
-        failed: r.failed,
-        followup_count: r.followup_count,
+
+        total: Number(r.total || 0),
+        ok: Number(r.ok || 0),
+        failed: Number(r.failed || 0),
+        followup_count: Number(r.followup_count || 0),
 
         phone_number_id: r.phone_number_id || null,
         sender_phone: r.sender_phone || r.display_phone_number || null,
-
-        sender_label: label, // ✅ ini yang dipakai UI
+        sender_label: label,
       };
     });
 
-    res.json({ status: "ok", logs });
+    return res.json({ status: "ok", logs });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ status: "error", message: "Gagal memuat logs" });
-  }
-});
-
-app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
-  const id = req.params.id;
-  const schoolId = req.user.school_id;
-
-  try {
-    const bRes = await pgPool.query("SELECT * FROM broadcasts WHERE id = $1 AND school_id = $2", [id, schoolId]);
-    if (!bRes.rows.length) return res.status(404).json({ status: "error", error: "Log not found" });
-
-    const broadcast = bRes.rows[0];
-    const rRes = await pgPool.query(`SELECT * FROM broadcast_recipients WHERE broadcast_id = $1 ORDER BY id`, [id]);
-    const fRes = await pgPool.query(`SELECT * FROM broadcast_followups WHERE broadcast_id = $1 ORDER BY at`, [id]);
-
-    return res.json({ status: "ok", log: { broadcast, recipients: rRes.rows, followups: fRes.rows } });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast/logs/:id:", err);
-    return res.status(500).json({ status: "error", error: String(err) });
+    console.error("Error /kirimpesan/broadcast/logs:", e);
+    return res.status(500).json({
+      status: "error",
+      message: "Gagal memuat logs",
+    });
   }
 });
 
