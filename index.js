@@ -1363,6 +1363,88 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 });
 
 // =====================
+// BROADCAST LOG DETAIL (SCOPED SCHOOL)
+// GET /kirimpesan/broadcast/logs/:id
+// =====================
+app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
+  try {
+    const schoolId = req.user.school_id;
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ status: "error", error: "id wajib" });
+
+    // 1) ambil broadcast (harus milik sekolah ini)
+    const bcQ = await pgPool.query(
+      `
+      SELECT
+        id,
+        created_at,
+        template_name,
+        sender_phone,
+        phone_number_id,
+        followup_enabled
+      FROM broadcasts
+      WHERE id = $1 AND school_id = $2
+      LIMIT 1
+      `,
+      [id, schoolId]
+    );
+
+    if (!bcQ.rows.length) {
+      return res.status(404).json({ status: "error", error: "Broadcast tidak ditemukan" });
+    }
+
+    const broadcast = bcQ.rows[0];
+
+    // 2) recipients
+    const recQ = await pgPool.query(
+      `
+      SELECT
+        phone,
+        vars_json,
+        follow_media,
+        follow_media_filename,
+        template_ok,
+        template_http_status,
+        template_error
+      FROM broadcast_recipients
+      WHERE broadcast_id = $1
+      ORDER BY created_at ASC
+      `,
+      [id]
+    );
+
+    // 3) followups
+    const folQ = await pgPool.query(
+      `
+      SELECT
+        phone,
+        at,
+        has_media,
+        media_link,
+        status,
+        error
+      FROM broadcast_followups
+      WHERE broadcast_id = $1
+      ORDER BY at ASC
+      `,
+      [id]
+    );
+
+    return res.json({
+      status: "ok",
+      log: {
+        broadcast,
+        recipients: recQ.rows || [],
+        followups: folQ.rows || [],
+      },
+    });
+  } catch (e) {
+    console.error("Error /kirimpesan/broadcast/logs/:id:", e);
+    return res.status(500).json({ status: "error", error: "Gagal memuat detail broadcast" });
+  }
+});
+
+// =====================
 // INBOX (SCOPED by school)
 // =====================
 app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
