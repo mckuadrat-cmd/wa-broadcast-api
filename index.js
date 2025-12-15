@@ -333,6 +333,15 @@ async function getCtxByPhoneNumberId(phoneNumberId) {
   throw new Error("Tidak bisa resolve config dari phone_number_id");
 }
 
+function cleanStr(v) {
+  if (v === undefined || v === null) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  const bad = ["null", "none", "nil", "-", "n/a"];
+  if (bad.includes(s.toLowerCase())) return "";
+  return s;
+}
+
 // =====================
 // UTIL
 // =====================
@@ -946,8 +955,8 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
-            row.follow_media || null,
-            row.follow_media_filename || null,
+            cleanStr(row.follow_media) || null,
+            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
           ]
         );
       }
@@ -979,8 +988,11 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       });
       const varsForTemplate = vars.slice(0, paramCount);
 
-      const headerDocument = row.follow_media
-        ? { link: row.follow_media, filename: row.follow_media_filename || null }
+      const mediaLink = cleanStr(row.follow_media);
+      const mediaName = cleanStr(row.follow_media_filename) || cleanStr(row.filename);
+      
+      const headerDocument = mediaLink
+        ? { link: mediaLink, filename: mediaName || null }
         : null;
 
       try {
@@ -1004,8 +1016,8 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
-            row.follow_media || null,
-            row.follow_media_filename || null,
+            cleanStr(row.follow_media) || null,
+            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
             true,
             r.status || null,
             null,
@@ -1573,8 +1585,11 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         const vars = varKeys.map((k) => varsMap[k]);
         const varsForTemplate = vars.slice(0, paramCount);
 
-        const headerDocument = rcp.follow_media
-          ? { link: rcp.follow_media, filename: rcp.follow_media_filename || null }
+        const mediaLink = cleanStr(rcp.follow_media);
+        const mediaName = cleanStr(rcp.follow_media_filename);
+        
+        const headerDocument = mediaLink
+          ? { link: mediaLink, filename: mediaName || null }
           : null;
 
         try {
