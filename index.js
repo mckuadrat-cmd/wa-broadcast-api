@@ -456,7 +456,7 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
 
   const body = {
     messaging_product: "whatsapp",
-    to: phone,
+    to: normPhone(phone),
     type: "template",
     template: {
       name: templateName,
