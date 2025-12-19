@@ -1174,20 +1174,71 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       [from]
     );
 
+    let mediaType = null;
+    let mediaId = null;
+    let mediaCaption = null;
+    
+    if (msg.type === "image") {
+      mediaType = "image";
+      mediaId = msg.image?.id || null;
+      mediaCaption = msg.image?.caption || null;
+    }
+    else if (msg.type === "video") {
+      mediaType = "video";
+      mediaId = msg.video?.id || null;
+      mediaCaption = msg.video?.caption || null;
+    }
+    else if (msg.type === "document") {
+      mediaType = "document";
+      mediaId = msg.document?.id || null;
+      mediaCaption = msg.document?.caption || null;
+    }
+    else if (msg.type === "audio") {
+      mediaType = "audio";
+      mediaId = msg.audio?.id || null;
+    }
+
     const row = q.rows[0] || null;
     const broadcastId = row?.broadcast_id || null;
 
     // simpan inbox_messages (best-effort)
     try {
       const isQuickReply = !!triggerText && (msg.type === "button" || msg.type === "interactive");
+    
       await pgPool.query(
-        `INSERT INTO inbox_messages
-         (at, phone, message_type, message_text, raw_json, broadcast_id, is_quick_reply, phone_number_id)
-         VALUES (NOW(), $1,$2,$3,$4,$5,$6,$7)`,
+        `INSERT INTO inbox_messages (
+          at,
+          phone,
+          message_type,
+          message_text,
+          media_type,
+          media_id,
+          media_caption,
+          raw_json,
+          broadcast_id,
+          is_quick_reply,
+          phone_number_id
+        )
+        VALUES (
+          NOW(),
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          $9,
+          $10
+        )`,
         [
           from,
           msg.type || null,
           triggerText || null,
+          mediaType,
+          mediaId,
+          mediaCaption,
           JSON.stringify(req.body || {}),
           broadcastId,
           isQuickReply,
