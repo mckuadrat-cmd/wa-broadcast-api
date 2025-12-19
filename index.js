@@ -813,10 +813,21 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       });
     }
 
+    // ambil semua contoh variabel berurutan
+    const bodyExamples = [];
+    
+    if (req.body.examples && Array.isArray(req.body.examples)) {
+      req.body.examples.forEach((v) => {
+        bodyExamples.push(String(v));
+      });
+    }
+    
     components.push({
       type: "BODY",
       text: body_text,
-      ...(example_1 ? { example: { body_text: [[example_1]] } } : {}),
+      ...(bodyExamples.length
+        ? { example: { body_text: [bodyExamples] } }
+        : {}),
     });
 
     if (footer_text) components.push({ type: "FOOTER", text: footer_text });
