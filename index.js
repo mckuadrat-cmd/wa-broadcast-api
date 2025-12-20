@@ -356,7 +356,7 @@ async function getWabaPhoneNumbers(ctx) {
 
   const url =
     `https://graph.facebook.com/${ctx.wa_version}/${ctx.waba_id}/phone_numbers` +
-    `?fields=id,display_phone_number,verified_name`;
+    `?fields=id,display_phone_number,verified_name,status`;
 
   const resp = await axios.get(url, {
     headers: { Authorization: `Bearer ${ctx.wa_token}` },
@@ -650,7 +650,15 @@ app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
     const rows = await getWabaPhoneNumbers(ctx);
 
-    const senders = rows.map((r) => ({
+    const onlyConnected =
+      String(req.query.only_connected || "").toLowerCase() === "1" ||
+      String(req.query.only_connected || "").toLowerCase() === "true";
+    
+    const filtered = onlyConnected
+      ? rows.filter((r) => String(r.status || "").toUpperCase() === "CONNECTED")
+      : rows;
+
+    const senders = filtered.map((r) => ({
       id: String(r.id),
       phone_number_id: String(r.id),
       phone: r.display_phone_number,
