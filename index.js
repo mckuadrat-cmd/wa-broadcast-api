@@ -463,7 +463,7 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
     })),
   });
 
-  const body = {
+  const payload = {
     messaging_product: "whatsapp",
     to: normPhone(phone),
     type: "template",
@@ -474,11 +474,14 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
     },
   };
 
-  const resp = await axios.post(url, body, {
-    headers: { Authorization: `Bearer ${ctx.wa_token}`, "Content-Type": "application/json" },
-  });
   try {
-    const resp = await axios.post(url, body, {...});
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${ctx.wa_token}`,
+        "Content-Type": "application/json",
+      },
+    });
+
     return {
       phone,
       ok: true,
@@ -487,12 +490,18 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
       error: null,
     };
   } catch (err) {
-    console.log("❌ META_ERR sendWaTemplate RAW");
-    console.log("URL:", url);
-    console.log("Payload:", JSON.stringify(body, null, 2));
-    console.log("Response:", JSON.stringify(err.response?.data || err.message, null, 2));
-    throw err; // WAJIB biar broadcast tau ini gagal
+    // ✅ ini log yang kamu butuh
+    console.log("❌ META_ERR sendWaTemplate");
+    console.log("to:", normPhone(phone));
+    console.log("template:", templateName, "lang:", langCode);
+    console.log("url:", url);
+    console.log("payload:", JSON.stringify(payload, null, 2));
+    console.log("status:", err.response?.status);
+    console.log("data:", JSON.stringify(err.response?.data || err.message, null, 2));
+
+    throw err; // penting: biar /broadcast bisa simpan error ke DB
   }
+}
 
 async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
   const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
