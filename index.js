@@ -477,14 +477,22 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
   const resp = await axios.post(url, body, {
     headers: { Authorization: `Bearer ${ctx.wa_token}`, "Content-Type": "application/json" },
   });
-
-  return {
-    phone,
-    ok: true,
-    status: resp.status,
-    messageId: resp.data?.messages?.[0]?.id ?? null,
-    error: null,
-  };
+  try {
+    const resp = await axios.post(url, body, {...});
+    return {
+      phone,
+      ok: true,
+      status: resp.status,
+      messageId: resp.data?.messages?.[0]?.id ?? null,
+      error: null,
+    };
+  } catch (err) {
+    console.log("❌ META_ERR sendWaTemplate RAW");
+    console.log("URL:", url);
+    console.log("Payload:", JSON.stringify(body, null, 2));
+    console.log("Response:", JSON.stringify(err.response?.data || err.message, null, 2));
+    throw err; // WAJIB biar broadcast tau ini gagal
+  }
 }
 
 async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
