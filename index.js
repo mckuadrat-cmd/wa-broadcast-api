@@ -1014,14 +1014,17 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
       // vars array dari row var1..varN
       const varsMap = {};
-      const varKeys = Object.keys(row)
-        .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
-        .sort((a, b) => parseInt(a.replace("var", ""), 10) - parseInt(b.replace("var", ""), 10));
-      const vars = varKeys.map((k) => {
-        varsMap[k] = row[k];
-        return row[k];
+      for (let i = 1; i <= paramCount; i++) {
+        const key = `var${i}`;
+        // ambil apa adanya, kalau kosong jadi ""
+        const val = row[key] == null ? "" : String(row[key]);
+        varsMap[key] = val;
+      }
+      
+      const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
+        const k = `var${idx + 1}`;
+        return varsMap[k] ?? "";
       });
-      const varsForTemplate = vars.slice(0, paramCount);
 
       const mediaLink = cleanStr(row.follow_media);
       const mediaName = cleanStr(row.follow_media_filename) || cleanStr(row.filename);
@@ -1671,13 +1674,18 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         const phone = rcp.phone;
         if (!phone) continue;
 
-        const varsMap = rcp.vars_json || {};
-        const varKeys = Object.keys(varsMap)
-          .filter((k) => /^var\d+$/.test(k))
-          .sort((a, b) => parseInt(a.replace("var", ""), 10) - parseInt(b.replace("var", ""), 10));
-
-        const vars = varKeys.map((k) => varsMap[k]);
-        const varsForTemplate = vars.slice(0, paramCount);
+        const varsMap = {};
+        for (let i = 1; i <= paramCount; i++) {
+          const key = `var${i}`;
+          // ambil apa adanya, kalau kosong jadi ""
+          const val = row[key] == null ? "" : String(row[key]);
+          varsMap[key] = val;
+        }
+        
+        const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
+          const k = `var${idx + 1}`;
+          return varsMap[k] ?? "";
+        });
 
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
