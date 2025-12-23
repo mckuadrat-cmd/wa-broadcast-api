@@ -493,7 +493,6 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
     console.log("Response:", JSON.stringify(err.response?.data || err.message, null, 2));
     throw err; // WAJIB biar broadcast tau ini gagal
   }
-}
 
 async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
   const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
