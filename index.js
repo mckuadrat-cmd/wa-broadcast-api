@@ -1042,17 +1042,25 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             null,
           ]
         );
-      } catch (err) {
-        const errorPayload = err.response?.data || err.message;
-        results.push({
-          phone,
-          ok: false,
-          status: err.response?.status || 500,
-          messageId: null,
-          error: errorPayload,
-        });
-
-        await pgPool.query(
+        } catch (err) {
+          console.log("❌ META_ERR /broadcast");
+          console.log("Status:", err.response?.status);
+          console.log(
+            "Data:",
+            JSON.stringify(err.response?.data || err.message, null, 2)
+          );
+        
+          const errorPayload = err.response?.data || err.message;
+        
+          results.push({
+            phone,
+            ok: false,
+            status: err.response?.status || 500,
+            messageId: null,
+            error: errorPayload,
+          });
+        
+          await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              template_ok, template_http_status, template_error, created_at
@@ -1682,11 +1690,17 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
               WHERE id = $1`,
             [rcp.id, r.status || null]
           );
-        } catch (err) {
-          failCount++;
-          const errorPayload = err.response?.data || err.message;
-
-          await pgPool.query(
+          } catch (err) {
+            console.log("❌ META_ERR /run-scheduled");
+            console.log("Status:", err.response?.status);
+            console.log(
+              "Data:",
+              JSON.stringify(err.response?.data || err.message, null, 2)
+            );
+          
+            const errorPayload = err.response?.data || err.message;
+          
+            await pgPool.query(
             `UPDATE broadcast_recipients
                 SET template_ok = FALSE,
                     template_http_status = $2,
