@@ -897,7 +897,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
   try {
     const ctx = await getCtxByUserId(req.user.sub);
 
-    const { template_name, rows, phone_number_id, sender_phone, followup, scheduled_at } = req.body || {};
+    const { template_name, rows, phone_number_id, sender_phone, followup, scheduled_at, broadcast_id } = req.body || {};
 
     if (!template_name) return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
     if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
