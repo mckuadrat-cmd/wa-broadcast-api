@@ -980,9 +980,15 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         if (!phone) continue;
 
         const varsMap = {};
+        
+        // var1..varN tetap disimpan
         Object.keys(row)
           .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
           .forEach((k) => (varsMap[k] = row[k]));
+        
+        // ✅ simpan contactname juga (kalau ada)
+        const cn = cleanStr(row.contactname);
+        if (cn) varsMap.contactname = cn;
 
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
@@ -1022,6 +1028,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         // ambil apa adanya, kalau kosong jadi ""
         const val = row[key] == null ? "" : String(row[key]);
         varsMap[key] = val;
+
+        const cn = cleanStr(row.contactname);
+        if (cn) varsMap.contactname = cn;
       }
       
       const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
