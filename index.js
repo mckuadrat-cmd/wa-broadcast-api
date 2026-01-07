@@ -1676,27 +1676,25 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       for (const rcp of recipients) {
         const phone = rcp.phone;
         if (!phone) continue;
-
-        const varsMap = {};
-        for (let i = 1; i <= paramCount; i++) {
-          const key = `var${i}`;
-          // ambil apa adanya, kalau kosong jadi ""
-          const val = row[key] == null ? "" : String(row[key]);
-          varsMap[key] = val;
-        }
-        
+      
+        // ✅ ambil dari DB (broadcast_recipients.vars_json)
+        const varsMapRaw = rcp.vars_json || {};
+        const varsMap = typeof varsMapRaw === "string"
+          ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
+          : varsMapRaw;
+      
         const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
           const k = `var${idx + 1}`;
-          return varsMap[k] ?? "";
+          return varsMap?.[k] != null ? String(varsMap[k]) : "";
         });
-
+      
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
-        
+      
         const headerDocument = mediaLink
           ? { link: mediaLink, filename: mediaName || null }
           : null;
-
+      
         try {
           const r = await sendWaTemplate(ctx, {
             phone,
@@ -1706,9 +1704,9 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
             phone_number_id: bc.phone_number_id || undefined,
             headerDocument,
           });
-
+      
           okCount++;
-
+      
           await pgPool.query(
             `UPDATE broadcast_recipients
                 SET template_ok = TRUE,
@@ -1717,17 +1715,12 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
               WHERE id = $1`,
             [rcp.id, r.status || null]
           );
-          } catch (err) {
-            console.log("❌ META_ERR /run-scheduled");
-            console.log("Status:", err.response?.status);
-            console.log(
-              "Data:",
-              JSON.stringify(err.response?.data || err.message, null, 2)
-            );
-          
-            const errorPayload = err.response?.data || err.message;
-          
-            await pgPool.query(
+        } catch (err) {
+          failCount++; // ✅ ini sebelumnya gak pernah naik
+      
+          const errorPayload = err.response?.data || err.message;
+      
+          await pgPool.query(
             `UPDATE broadcast_recipients
                 SET template_ok = FALSE,
                     template_http_status = $2,
