@@ -920,7 +920,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     }
 
     // broadcastId
-    const broadcastId = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    const broadcastId = 
+      (broadcast_id && String(broadcast_id).trim()) ||
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 
     // resolve phone_number_id
     let effectivePhoneId = phone_number_id ? String(phone_number_id) : null;
