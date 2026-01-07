@@ -976,7 +976,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     // mode scheduled: simpan recipients saja
     if (isScheduled) {
       for (const row of rows) {
-        const phone = row.phone || row.to;
+        const phone = normPhone(row.phone || row.to);
         if (!phone) continue;
 
         const varsMap = {};
@@ -1018,20 +1018,20 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     const results = [];
 
     for (const row of rows) {
-      const phone = row.phone || row.to;
+      const phone = normPhone(row.phone || row.to);
       if (!phone) continue;
 
       // vars array dari row var1..varN
       const varsMap = {};
       for (let i = 1; i <= paramCount; i++) {
         const key = `var${i}`;
-        // ambil apa adanya, kalau kosong jadi ""
         const val = row[key] == null ? "" : String(row[key]);
         varsMap[key] = val;
-
-        const cn = cleanStr(row.contactname);
-        if (cn) varsMap.contactname = cn;
       }
+      
+      // ✅ simpan contactname (tidak tergantung paramCount)
+      const cn = cleanStr(row.contactname);
+      if (cn) varsMap.contactname = cn;
       
       const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
         const k = `var${idx + 1}`;
