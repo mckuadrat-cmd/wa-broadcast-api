@@ -1005,14 +1005,24 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
-             template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NULL, NULL, NULL, NOW())`,
+             status, attempts, next_attempt_at,
+             last_error, meta_message_id,
+             sent_at, last_attempt_at, attempt_count,
+             template_ok, template_http_status, template_error,
+             created_at
+           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, +             
+               'queued', 0, $6,
+               NULL, NULL,
+               NULL, NULL, 0,
+               NULL, NULL, NULL,
+               NOW())`,
           [
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
             cleanStr(row.follow_media) || null,
             (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
+            scheduledDate, // next_attempt_at = scheduled_at (REAL schedule time)
           ]
         );
       }
@@ -1050,11 +1060,15 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              status, attempts, next_attempt_at,
+             last_error, meta_message_id,
+             sent_at, last_attempt_at, attempt_count,
              template_ok, template_http_status, template_error,
              created_at
            ) VALUES (
              gen_random_uuid(), $1, $2, $3, $4, $5,
              'queued', 0, NOW(),
+             NULL, NULL,
+             NULL, NULL, 0,
              NULL, NULL, NULL,
              NOW()
            )`,
@@ -1124,17 +1138,25 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
+             status, attempts, next_attempt_at,
+             last_error, meta_message_id,
+             sent_at, last_attempt_at, attempt_count,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+           ) VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5,
+             'sent', 0, NULL,
+             NULL, $6,
+             NOW(), NOW(), 1,
+             TRUE, $7, NULL, NOW()
+           )`,
           [
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
             cleanStr(row.follow_media) || null,
             (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
-            true,
+            r.messageId || null,
             r.status || null,
-            null,
           ]
         );
         } catch (err) {
@@ -1158,17 +1180,25 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
           await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
+             status, attempts, next_attempt_at,
+             last_error, meta_message_id,
+             sent_at, last_attempt_at, attempt_count,
              template_ok, template_http_status, template_error, created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+           ) VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5,
+             'failed', 0, NULL,
+             $6, NULL,
+             NULL, NOW(), 1,
+             FALSE, $7, $6, NOW()
+           )`,
           [
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
             cleanStr(row.follow_media) || null,
             (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
-            false,
-            err.response?.status || null,
             typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
+            err.response?.status || null,,
           ]
         );
       }
@@ -1260,7 +1290,36 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
+    const statuses = value?.statuses;
     const messages = value?.messages;
+
+    // =========================
+    // ✅ DELIVERY STATUS (REAL)
+    // =========================
+    if (statuses && Array.isArray(statuses) && statuses.length) {
+      for (const st of statuses) {
+        const msgId = st?.id || null;
+        const stStatus = st?.status || null; // sent | delivered | read | failed
+        if (!msgId || !stStatus) continue;
+
+        // kalau failed biasanya ada errors
+        const errPayload = st?.errors || null;
+        try {
+          await pgPool.query(
+            `
+            UPDATE broadcast_recipients
+            SET status = $2,
+                last_error = COALESCE($3, last_error)
+            WHERE meta_message_id = $1
+            `,
+            [msgId, stStatus, errPayload]
+          );
+        } catch (_) {
+          // best effort
+        }
+      }
+      return res.sendStatus(200);
+    }
 
     if (!messages || !messages.length) return res.sendStatus(200);
 
@@ -1483,6 +1542,8 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
       SELECT
         b.id,
         b.created_at,
+        b.scheduled_at,
+        b.status,
         b.template_name,
 
         COUNT(br.id) AS total,
@@ -1524,6 +1585,8 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
       return {
         id: r.id,
         created_at: r.created_at,
+        scheduled_at: r.scheduled_at,
+        status: r.status,
         template_name: r.template_name,
 
         total: Number(r.total || 0),
@@ -1563,6 +1626,8 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
       SELECT
         id,
         created_at,
+        scheduled_at,
+        status,
         template_name,
         sender_phone,
         phone_number_id,
@@ -1588,6 +1653,14 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
         vars_json,
         follow_media,
         follow_media_filename,
+        status,
+        attempts,
+        next_attempt_at,
+        last_error,
+        meta_message_id,
+        sent_at,
+        last_attempt_at,
+        attempt_count,
         template_ok,
         template_http_status,
         template_error
@@ -1749,6 +1822,18 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       for (const rcp of recipients) {
         const phone = rcp.phone;
         if (!phone) continue;
+
+        // mark attempt -> sending
+        try {
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+             SET status = 'sending',
+                 last_attempt_at = NOW(),
+                 attempt_count = attempt_count + 1
+             WHERE id = $1`,
+            [rcp.id]
+          );
+        } catch (_) {}
       
         // ✅ ambil dari DB (broadcast_recipients.vars_json)
         const varsMapRaw = rcp.vars_json || {};
@@ -1782,11 +1867,15 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       
           await pgPool.query(
             `UPDATE broadcast_recipients
-                SET template_ok = TRUE,
-                    template_http_status = $2,
-                    template_error = NULL
+                SET status = 'sent',
+                    meta_message_id = $2,
+                    sent_at = NOW(),
+                    template_ok = TRUE,
+                    template_http_status = $3,
+                    template_error = NULL,
+                    last_error = NULL
               WHERE id = $1`,
-            [rcp.id, r.status || null]
+            [rcp.id, r.messageId || null, r.status || null]
           );
         } catch (err) {
           failCount++; // ✅ ini sebelumnya gak pernah naik
@@ -1795,9 +1884,11 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       
           await pgPool.query(
             `UPDATE broadcast_recipients
-                SET template_ok = FALSE,
+                SET status = 'failed',
+                    template_ok = FALSE,
                     template_http_status = $2,
-                    template_error = $3
+                    template_error = $3,
+                    last_error = $3
               WHERE id = $1`,
             [
               rcp.id,
@@ -1944,7 +2035,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         await client.query(
           `
           UPDATE broadcast_recipients
-          SET status = 'sending'
+          SET status = 'sending',
+              last_attempt_at = NOW(),
+              attempt_count = attempt_count + 1
           WHERE id = ANY($1::uuid[])
           `,
           [ids]
@@ -2003,13 +2096,15 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
             `
             UPDATE broadcast_recipients
             SET status = 'sent',
+                meta_message_id = $2,
+                sent_at = NOW(),
                 template_ok = TRUE,
-                template_http_status = $2,
+                template_http_status = $3,
                 template_error = NULL,
                 last_error = NULL
             WHERE id = $1
             `,
-            [rcp.id, r.status || null]
+            [rcp.id, r.messageId || null, r.status || null]
           );
         } catch (err) {
           failCount++;
