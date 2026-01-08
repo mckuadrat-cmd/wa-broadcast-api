@@ -427,6 +427,17 @@ async function getDisplayPhoneByPhoneNumberId(schoolId, phoneNumberId) {
   return rows[0]?.display_phone_number || null;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeBackoffMs(attempts) {
+  // attempts setelah gagal: 1,2,3,...
+  // 1m, 5m, 15m
+  const minutes = attempts === 1 ? 1 : attempts === 2 ? 5 : 15;
+  return minutes * 60 * 1000;
+}
+
 // =====================
 // SENDERS
 // =====================
@@ -899,6 +910,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
 
     const { template_name, rows, phone_number_id, sender_phone, followup, scheduled_at, broadcast_id } = req.body || {};
+    const DIRECT_SEND_LIMIT = parseInt(process.env.DIRECT_SEND_LIMIT || "200", 10);
 
     if (!template_name) return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
     if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
@@ -1011,6 +1023,58 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         template_name,
         scheduled_at: scheduledDate.toISOString(),
         count: rows.length,
+      });
+    }
+
+    // =========================
+    // ✅ AUTO-QUEUE (IMMEDIATE)
+    // kalau banyak penerima, jangan kirim sync (biar gak timeout)
+    // =========================
+    if (!isScheduled && rows.length > DIRECT_SEND_LIMIT) {
+      // update broadcast status -> queued (tadi initialStatus = sending, kita koreksi)
+      await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [broadcastId]);
+
+      for (const row of rows) {
+        const phone = normPhone(row.phone || row.to);
+        if (!phone) continue;
+
+        const varsMap = {};
+        Object.keys(row)
+          .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
+          .forEach((k) => (varsMap[k] = row[k]));
+
+        const cn = cleanStr(row.contactname);
+        if (cn) varsMap.contactname = cn;
+
+        await pgPool.query(
+          `INSERT INTO broadcast_recipients (
+             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
+             status, attempts, next_attempt_at,
+             template_ok, template_http_status, template_error,
+             created_at
+           ) VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5,
+             'queued', 0, NOW(),
+             NULL, NULL, NULL,
+             NOW()
+           )`,
+          [
+            broadcastId,
+            phone,
+            Object.keys(varsMap).length ? varsMap : null,
+            cleanStr(row.follow_media) || null,
+            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
+          ]
+        );
+      }
+
+      return res.json({
+        status: "queued",
+        broadcast_id: broadcastId,
+        template_name,
+        count: rows.length,
+        limit: DIRECT_SEND_LIMIT,
+        note: "Masuk queue (diproses oleh /broadcast/run-queue via cron)",
       });
     }
 
@@ -1751,6 +1815,277 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
     return res.json({ status: "ok", ran });
   } catch (err) {
     console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
+    return res.status(500).json({ status: "error", error: String(err) });
+  }
+});
+
+// =====================
+// RUN QUEUE (IMMEDIATE JOBS)
+// GET /kirimpesan/broadcast/run-queue?secret=...&limit=100&delay=400&max_broadcasts=5
+// =====================
+app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
+  const secret = req.headers["x-cron-secret"] || req.query.secret;
+  if (secret !== CRON_SECRET) {
+    return res.status(403).json({ status: "error", error: "Forbidden" });
+  }
+
+  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);      // batch recipients per broadcast
+  const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);     // jeda per pesan (ms)
+  const maxBroadcasts = Math.min(parseInt(req.query.max_broadcasts || "5", 10), 20);
+  const maxAttempts = Math.min(parseInt(req.query.max_attempts || "3", 10), 10);
+
+  try {
+    // Ambil beberapa broadcast yang sedang antri
+    const { rows: broadcasts } = await pgPool.query(
+      `
+      SELECT *
+      FROM broadcasts
+      WHERE status IN ('queued','sending')
+      ORDER BY created_at ASC
+      LIMIT $1
+      `,
+      [maxBroadcasts]
+    );
+
+    if (!broadcasts.length) return res.json({ status: "ok", ran: [] });
+
+    const ran = [];
+
+    for (const bc of broadcasts) {
+      // Resolve ctx (token, waba, version)
+      let ctx = null;
+      try {
+        if (bc.school_id) ctx = await getCtxBySchoolId(bc.school_id);
+      } catch (_) {
+        ctx = null;
+      }
+
+      if (!ctx) {
+        ctx = {
+          wa_token: ENV_WA_TOKEN,
+          wa_version: ENV_WA_VERSION,
+          template_lang: ENV_TEMPLATE_LANG,
+          waba_id: ENV_WABA_ID,
+          phone_number_id: bc.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+        };
+      }
+
+      if (!ctx.wa_token || !ctx.waba_id) {
+        console.warn("ctx WA tidak tersedia; run-queue skip broadcast:", bc.id);
+        continue;
+      }
+
+      // Metadata template sekali per broadcast
+      const { paramCount, language } = await getTemplateMetadata(ctx, bc.template_name);
+
+      // 1) Ambil batch recipients secara aman pakai SKIP LOCKED
+      const client = await pgPool.connect();
+      let batch = [];
+
+      try {
+        await client.query("BEGIN");
+
+        // Mark broadcast as sending (biar kelihatan aktif)
+        await client.query(`UPDATE broadcasts SET status = 'sending' WHERE id = $1`, [bc.id]);
+
+        const recQ = await client.query(
+          `
+          SELECT id, phone, vars_json, follow_media, follow_media_filename, attempts
+          FROM broadcast_recipients
+          WHERE broadcast_id = $1
+            AND status IN ('queued','error')
+            AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+          ORDER BY created_at ASC
+          LIMIT $2
+          FOR UPDATE SKIP LOCKED
+          `,
+          [bc.id, limit]
+        );
+
+        batch = recQ.rows || [];
+
+        if (!batch.length) {
+          await client.query("COMMIT");
+
+          // Kalau gak ada yang bisa diproses sekarang, cek apakah masih ada queued/error yang nunggu waktu
+          const leftQ = await pgPool.query(
+            `
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ('queued','sending','error'))::int AS left_active,
+              COUNT(*) FILTER (WHERE status = 'dead')::int AS dead_count,
+              COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_count
+            FROM broadcast_recipients
+            WHERE broadcast_id = $1
+            `,
+            [bc.id]
+          );
+
+          const leftActive = leftQ.rows[0]?.left_active || 0;
+          const deadCount = leftQ.rows[0]?.dead_count || 0;
+          const sentCount = leftQ.rows[0]?.sent_count || 0;
+
+          if (leftActive === 0) {
+            // selesai
+            const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
+            await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
+          } else {
+            // masih ada tapi nunggu next_attempt_at -> biarkan status sending/queued? kita set queued biar rapi
+            await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+          }
+
+          ran.push({ broadcast_id: bc.id, picked: 0, ok: 0, failed: 0, note: "no-eligible-batch" });
+          continue;
+        }
+
+        // Mark recipients batch -> sending
+        const ids = batch.map((r) => r.id);
+        await client.query(
+          `
+          UPDATE broadcast_recipients
+          SET status = 'sending'
+          WHERE id = ANY($1::uuid[])
+          `,
+          [ids]
+        );
+
+        await client.query("COMMIT");
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        client.release();
+        console.error("run-queue tx error:", e);
+        continue;
+      } finally {
+        client.release();
+      }
+
+      // 2) Kirim satu-satu + delay + retry/backoff
+      let okCount = 0;
+      let failCount = 0;
+
+      for (const rcp of batch) {
+        const phone = rcp.phone;
+        if (!phone) continue;
+
+        const varsMapRaw = rcp.vars_json || {};
+        const varsMap =
+          typeof varsMapRaw === "string"
+            ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
+            : varsMapRaw;
+
+        const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
+          const k = `var${idx + 1}`;
+          return varsMap?.[k] != null ? String(varsMap[k]) : "";
+        });
+
+        const mediaLink = cleanStr(rcp.follow_media);
+        const mediaName = cleanStr(rcp.follow_media_filename);
+
+        const headerDocument = mediaLink
+          ? { link: mediaLink, filename: mediaName || null }
+          : null;
+
+        try {
+          const r = await sendWaTemplate(ctx, {
+            phone,
+            templateName: bc.template_name,
+            templateLanguage: language,
+            vars: varsForTemplate,
+            phone_number_id: bc.phone_number_id || undefined,
+            headerDocument,
+          });
+
+          okCount++;
+
+          await pgPool.query(
+            `
+            UPDATE broadcast_recipients
+            SET status = 'sent',
+                template_ok = TRUE,
+                template_http_status = $2,
+                template_error = NULL,
+                last_error = NULL
+            WHERE id = $1
+            `,
+            [rcp.id, r.status || null]
+          );
+        } catch (err) {
+          failCount++;
+
+          const errorPayload = err.response?.data || err.message;
+          const currentAttempts = (rcp.attempts || 0) + 1;
+
+          const shouldDead = currentAttempts >= maxAttempts;
+          const nextAttemptAt = shouldDead
+            ? null
+            : new Date(Date.now() + computeBackoffMs(currentAttempts));
+
+          await pgPool.query(
+            `
+            UPDATE broadcast_recipients
+            SET status = $2,
+                attempts = attempts + 1,
+                next_attempt_at = $3,
+                template_ok = FALSE,
+                template_http_status = $4,
+                template_error = $5,
+                last_error = $5
+            WHERE id = $1
+            `,
+            [
+              rcp.id,
+              shouldDead ? "dead" : "error",
+              nextAttemptAt,
+              err.response?.status || null,
+              typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
+            ]
+          );
+        }
+
+        // ✅ jeda per pesan
+        await sleep(delay);
+      }
+
+      // 3) Setelah batch, cek sisa. Kalau selesai -> mark broadcast final
+      const leftQ = await pgPool.query(
+        `
+        SELECT
+          COUNT(*) FILTER (WHERE status IN ('queued','sending','error'))::int AS left_active,
+          COUNT(*) FILTER (WHERE status = 'dead')::int AS dead_count,
+          COUNT(*) FILTER (WHERE status = 'sent')::int AS sent_count
+        FROM broadcast_recipients
+        WHERE broadcast_id = $1
+        `,
+        [bc.id]
+      );
+
+      const leftActive = leftQ.rows[0]?.left_active || 0;
+      const deadCount = leftQ.rows[0]?.dead_count || 0;
+      const sentCount = leftQ.rows[0]?.sent_count || 0;
+
+      if (leftActive === 0) {
+        const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
+        await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
+      } else {
+        // Masih ada kerjaan -> balikkan ke queued agar cron lanjutin
+        await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+      }
+
+      ran.push({
+        broadcast_id: bc.id,
+        picked: batch.length,
+        ok: okCount,
+        failed: failCount,
+        left_active: leftActive,
+        sent_total: sentCount,
+        dead_total: deadCount,
+        delay_ms: delay,
+        batch_limit: limit,
+      });
+    }
+
+    return res.json({ status: "ok", ran });
+  } catch (err) {
+    console.error("Error /kirimpesan/broadcast/run-queue:", err);
     return res.status(500).json({ status: "error", error: String(err) });
   }
 });
