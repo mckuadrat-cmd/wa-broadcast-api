@@ -1831,6 +1831,8 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
 
   const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);      // batch recipients per broadcast
   const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);     // jeda per pesan (ms)
+  const pauseEvery = Math.min(parseInt(req.query.pause_every || "50", 10), 1000); // tiap N pesan
+  const pauseMs = Math.min(parseInt(req.query.pause_ms || "5000", 10), 60000);     // lama pause (ms)
   const maxBroadcasts = Math.min(parseInt(req.query.max_broadcasts || "5", 10), 20);
   const maxAttempts = Math.min(parseInt(req.query.max_attempts || "3", 10), 10);
 
@@ -1961,29 +1963,30 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
       // 2) Kirim satu-satu + delay + retry/backoff
       let okCount = 0;
       let failCount = 0;
-
+      let sentCounter = 0;
+      
       for (const rcp of batch) {
         const phone = rcp.phone;
         if (!phone) continue;
-
+      
         const varsMapRaw = rcp.vars_json || {};
         const varsMap =
           typeof varsMapRaw === "string"
             ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
             : varsMapRaw;
-
+      
         const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
           const k = `var${idx + 1}`;
           return varsMap?.[k] != null ? String(varsMap[k]) : "";
         });
-
+      
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
-
+      
         const headerDocument = mediaLink
           ? { link: mediaLink, filename: mediaName || null }
           : null;
-
+      
         try {
           const r = await sendWaTemplate(ctx, {
             phone,
@@ -1993,9 +1996,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
             phone_number_id: bc.phone_number_id || undefined,
             headerDocument,
           });
-
+      
           okCount++;
-
+      
           await pgPool.query(
             `
             UPDATE broadcast_recipients
@@ -2010,15 +2013,15 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           );
         } catch (err) {
           failCount++;
-
+      
           const errorPayload = err.response?.data || err.message;
           const currentAttempts = (rcp.attempts || 0) + 1;
-
+      
           const shouldDead = currentAttempts >= maxAttempts;
           const nextAttemptAt = shouldDead
             ? null
             : new Date(Date.now() + computeBackoffMs(currentAttempts));
-
+      
           await pgPool.query(
             `
             UPDATE broadcast_recipients
@@ -2040,9 +2043,16 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
             ]
           );
         }
-
-        // ✅ jeda per pesan
-        await sleep(delay);
+      
+        sentCounter++;
+      
+        // ✅ micro delay tiap pesan
+        if (delay > 0) await sleep(delay);
+      
+        // ✅ burst pause tiap N pesan
+        if (pauseEvery > 0 && sentCounter % pauseEvery === 0) {
+          await sleep(pauseMs);
+        }
       }
 
       // 3) Setelah batch, cek sisa. Kalau selesai -> mark broadcast final
