@@ -1009,13 +1009,17 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
              last_error, meta_message_id,
              sent_at, last_attempt_at, attempt_count,
              template_ok, template_http_status, template_error,
+             queued_at, status_updated_at,
              created_at
-           ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, +             
-               'queued', 0, $6,
-               NULL, NULL,
-               NULL, NULL, 0,
-               NULL, NULL, NULL,
-               NOW())`,
+           ) VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5,
+             'queued', 0, $6,
+             NULL, NULL,
+             NULL, NULL, 0,
+             NULL, NULL, NULL,
+             NOW(), NOW(),
+             NOW()
+           )`,
           [
             broadcastId,
             phone,
@@ -1063,6 +1067,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
              last_error, meta_message_id,
              sent_at, last_attempt_at, attempt_count,
              template_ok, template_http_status, template_error,
+             queued_at, status_updated_at,
              created_at
            ) VALUES (
              gen_random_uuid(), $1, $2, $3, $4, $5,
@@ -1070,6 +1075,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
              NULL, NULL,
              NULL, NULL, 0,
              NULL, NULL, NULL,
+             NOW(), NOW(),
              NOW()
            )`,
           [
@@ -1299,24 +1305,29 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     if (statuses && Array.isArray(statuses) && statuses.length) {
       for (const st of statuses) {
         const msgId = st?.id || null;
-        const stStatus = st?.status || null; // sent | delivered | read | failed
+        const stStatus = String(st?.status || "").toLowerCase(); // sent|delivered|read|failed
         if (!msgId || !stStatus) continue;
-
-        // kalau failed biasanya ada errors
+    
         const errPayload = st?.errors || null;
-        try {
-          await pgPool.query(
-            `
-            UPDATE broadcast_recipients
-            SET status = $2,
-                last_error = COALESCE($3, last_error)
-            WHERE meta_message_id = $1
-            `,
-            [msgId, stStatus, errPayload]
-          );
-        } catch (_) {
-          // best effort
-        }
+    
+        // pilih kolom timestamp yang mau diisi
+        const deliveredAt = stStatus === "delivered" ? "NOW()" : "NULL";
+        const readAt      = stStatus === "read"      ? "NOW()" : "NULL";
+        const failedAt    = stStatus === "failed"    ? "NOW()" : "NULL";
+    
+        await pgPool.query(
+          `
+          UPDATE broadcast_recipients
+          SET status = $2,
+              status_updated_at = NOW(),
+              delivered_at = COALESCE(delivered_at, ${deliveredAt}),
+              read_at      = COALESCE(read_at, ${readAt}),
+              failed_at    = COALESCE(failed_at, ${failedAt}),
+              last_error   = CASE WHEN $2 = 'failed' THEN COALESCE($3, last_error) ELSE last_error END
+          WHERE meta_message_id = $1
+          `,
+          [msgId, stStatus, errPayload ? JSON.stringify(errPayload) : null]
+        );
       }
       return res.sendStatus(200);
     }
@@ -1828,6 +1839,8 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           await pgPool.query(
             `UPDATE broadcast_recipients
              SET status = 'sending',
+                 sending_at = NOW(),
+                 status_updated_at = NOW(),
                  last_attempt_at = NOW(),
                  attempt_count = attempt_count + 1
              WHERE id = $1`,
@@ -1865,18 +1878,21 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       
           okCount++;
       
-          await pgPool.query(
-            `UPDATE broadcast_recipients
-                SET status = 'sent',
-                    meta_message_id = $2,
-                    sent_at = NOW(),
-                    template_ok = TRUE,
-                    template_http_status = $3,
-                    template_error = NULL,
-                    last_error = NULL
-              WHERE id = $1`,
-            [rcp.id, r.messageId || null, r.status || null]
-          );
+            await pgPool.query(
+              `UPDATE broadcast_recipients
+                  SET status = 'sent',
+                      status_updated_at = NOW(),
+                      meta_message_id = $2,
+                      api_accepted_at = NOW(),
+                      sent_at = NOW(),
+                      template_ok = TRUE,
+                      template_http_status = $3,
+                      template_error = NULL,
+                      last_error = NULL
+                WHERE id = $1`,
+              [rcp.id, r.messageId || null, r.status || null]
+            );
+
         } catch (err) {
           failCount++; // ✅ ini sebelumnya gak pernah naik
       
@@ -1885,6 +1901,8 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           await pgPool.query(
             `UPDATE broadcast_recipients
                 SET status = 'failed',
+                    status_updated_at = NOW(),
+                    failed_at = NOW(),
                     template_ok = FALSE,
                     template_http_status = $2,
                     template_error = $3,
@@ -2034,11 +2052,13 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         const ids = batch.map((r) => r.id);
         await client.query(
           `
-          UPDATE broadcast_recipients
-          SET status = 'sending',
-              last_attempt_at = NOW(),
-              attempt_count = attempt_count + 1
-          WHERE id = ANY($1::uuid[])
+            UPDATE broadcast_recipients
+            SET status = 'sending',
+                sending_at = NOW(),
+                status_updated_at = NOW(),
+                last_attempt_at = NOW(),
+                attempt_count = attempt_count + 1
+            WHERE id = ANY($1::uuid[])
           `,
           [ids]
         );
@@ -2093,17 +2113,17 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           okCount++;
       
           await pgPool.query(
-            `
-            UPDATE broadcast_recipients
-            SET status = 'sent',
-                meta_message_id = $2,
-                sent_at = NOW(),
-                template_ok = TRUE,
-                template_http_status = $3,
-                template_error = NULL,
-                last_error = NULL
-            WHERE id = $1
-            `,
+            `UPDATE broadcast_recipients
+                SET status = 'sent',
+                    status_updated_at = NOW(),
+                    meta_message_id = $2,
+                    api_accepted_at = NOW(),
+                    sent_at = NOW(),
+                    template_ok = TRUE,
+                    template_http_status = $3,
+                    template_error = NULL,
+                    last_error = NULL
+              WHERE id = $1`,
             [rcp.id, r.messageId || null, r.status || null]
           );
         } catch (err) {
@@ -2118,21 +2138,17 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
             : new Date(Date.now() + computeBackoffMs(currentAttempts));
       
           await pgPool.query(
-            `
-            UPDATE broadcast_recipients
-            SET status = $2,
-                attempts = attempts + 1,
-                next_attempt_at = $3,
-                template_ok = FALSE,
-                template_http_status = $4,
-                template_error = $5,
-                last_error = $5
-            WHERE id = $1
-            `,
+            `UPDATE broadcast_recipients
+                SET status = 'failed',
+                    status_updated_at = NOW(),
+                    failed_at = NOW(),
+                    template_ok = FALSE,
+                    template_http_status = $2,
+                    template_error = $3,
+                    last_error = $3
+              WHERE id = $1`,
             [
               rcp.id,
-              shouldDead ? "dead" : "error",
-              nextAttemptAt,
               err.response?.status || null,
               typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
             ]
