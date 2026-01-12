@@ -1578,10 +1578,23 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 
         -- ✅ API accepted / attempted (masuk sistem WA)
         COUNT(br.id) FILTER (
-          WHERE br.meta_message_id IS NOT NULL
+          WHERE br.template_ok = TRUE
+             OR br.meta_message_id IS NOT NULL
              OR br.api_accepted_at IS NOT NULL
              OR br.sent_at IS NOT NULL
+             OR LOWER(COALESCE(br.status,'')) IN ('sent','delivered','read')
         ) AS sent_count,
+
+        COUNT(br.id) FILTER (
+          WHERE br.template_ok IS NOT NULL
+             OR br.meta_message_id IS NOT NULL
+             OR br.api_accepted_at IS NOT NULL
+             OR br.sent_at IS NOT NULL
+             OR br.failed_at IS NOT NULL
+             OR br.delivered_at IS NOT NULL
+             OR br.read_at IS NOT NULL
+             OR LOWER(COALESCE(br.status,'')) IN ('failed','dead','sent','delivered','read','error')
+        ) AS processed_count,
 
         -- ✅ delivered/read dari webhook
         COUNT(br.id) FILTER (WHERE br.delivered_at IS NOT NULL) AS delivered_count,
@@ -1638,7 +1651,8 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 
       // pending versi list: yang belum diproses API
       // (accepted + apiError) dianggap sudah diproses
-      const pending = Math.max(total - sent - failedApi, 0);
+      const processed = Number(r.processed_count || 0);
+      const pending = Math.max(total - processed, 0);
 
       const label =
         (r.verified_name && String(r.verified_name).trim()) ||
