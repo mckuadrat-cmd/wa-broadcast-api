@@ -1542,29 +1542,18 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
 // =====================
 // BROADCAST LOGS (SCOPED SCHOOL)
-// contoh: GET /kirimpesan/broadcast/logs?limit=50
-// ✅ Hitung agregat dari broadcast_recipients (single source of truth)
+// GET /kirimpesan/broadcast/logs?limit=50
+// Definisi (sesuai kamu):
+// - Error     : gagal API (request ditolak), tidak pernah accepted
+// - Failed    : gagal delivery (failed_at / status failed/dead/undelivered)
+// - Delivered : delivered_at != null
+// - Read      : read_at != null
+// - Sent      : total - Failed - Error
 // =====================
 app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
     const schoolId = req.user.school_id;
-
-    // NOTE:
-    // - sent_count        : API accepted (ada meta_message_id / api_accepted_at / sent_at)
-    // - delivered_count   : delivered_at != null
-    // - read_count        : read_at != null
-    // - failed_api_count  : gagal API (template_ok=false + tidak ada meta_message_id/api_accepted_at/sent_at)
-    // - failed_delivery_count : gagal delivery (failed_at != null OR status failed/dead)
-    //
-    // "failed_total" = failed_api + failed_delivery
-    //
-    // Legacy compatibility:
-    // - ok     -> kita isi dengan sent_count (biar list lama masih masuk akal)
-    // - failed -> kita isi dengan failed_api_count (biar pending tidak jadi negatif)
-    //
-    // Untuk UI baru:
-    // - pakai sent / delivered / read / failed_total / failed_delivery / failed_api
 
     const q = `
       SELECT
@@ -1573,51 +1562,35 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
         b.scheduled_at,
         b.status,
         b.template_name,
+        b.phone_number_id,
+        b.sender_phone,
 
         COUNT(br.id) AS total,
 
-        -- ✅ API accepted / attempted (masuk sistem WA)
+        -- ✅ Error: gagal API (ditolak) + belum pernah accepted
         COUNT(br.id) FILTER (
-          WHERE br.template_ok = TRUE
-             OR br.meta_message_id IS NOT NULL
-             OR br.api_accepted_at IS NOT NULL
-             OR br.sent_at IS NOT NULL
-             OR LOWER(COALESCE(br.status,'')) IN ('sent','delivered','read')
-        ) AS sent_count,
-
-        COUNT(br.id) FILTER (
-          WHERE br.template_ok IS NOT NULL
-             OR br.meta_message_id IS NOT NULL
-             OR br.api_accepted_at IS NOT NULL
-             OR br.sent_at IS NOT NULL
-             OR br.failed_at IS NOT NULL
-             OR br.delivered_at IS NOT NULL
-             OR br.read_at IS NOT NULL
-             OR LOWER(COALESCE(br.status,'')) IN ('failed','dead','sent','delivered','read','error')
-        ) AS processed_count,
-
-        -- ✅ delivered/read dari webhook
-        COUNT(br.id) FILTER (WHERE br.delivered_at IS NOT NULL) AS delivered_count,
-        COUNT(br.id) FILTER (WHERE br.read_at IS NOT NULL)      AS read_count,
-
-        -- ✅ gagal delivery (setelah accepted)
-        COUNT(br.id) FILTER (
-          WHERE br.failed_at IS NOT NULL
-             OR LOWER(COALESCE(br.status,'')) IN ('failed','dead')
-        ) AS failed_delivery_count,
-
-        -- ✅ gagal API (tidak pernah accepted)
-        COUNT(br.id) FILTER (
-          WHERE br.template_ok = FALSE
+          WHERE
+            (
+              br.template_ok = FALSE
+              OR (br.template_http_status IS NOT NULL AND br.template_http_status >= 400)
+              OR LOWER(COALESCE(br.status,'')) IN ('error','api_error')
+            )
             AND br.meta_message_id IS NULL
             AND br.api_accepted_at IS NULL
             AND br.sent_at IS NULL
-        ) AS failed_api_count,
+        ) AS error_count,
+
+        -- ✅ Failed: gagal delivery (setelah accepted / status fail)
+        COUNT(br.id) FILTER (
+          WHERE br.failed_at IS NOT NULL
+             OR LOWER(COALESCE(br.status,'')) IN ('failed','dead','undelivered')
+        ) AS failed_count,
+
+        -- ✅ Delivered/Read dari webhook
+        COUNT(br.id) FILTER (WHERE br.delivered_at IS NOT NULL) AS delivered_count,
+        COUNT(br.id) FILTER (WHERE br.read_at IS NOT NULL)      AS read_count,
 
         COUNT(bf.id) AS followup_count,
-
-        b.phone_number_id,
-        b.sender_phone,
 
         spn.display_phone_number,
         spn.verified_name
@@ -1642,19 +1615,20 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 
     const logs = rows.map((r) => {
       const total = Number(r.total || 0);
-      const sent = Number(r.sent_count || 0);
+      const error = Number(r.error_count || 0);
+      const failed = Number(r.failed_count || 0);
       const delivered = Number(r.delivered_count || 0);
       const read = Number(r.read_count || 0);
-      const failedApi = Number(r.failed_api_count || 0);
-      const failedDelivery = Number(r.failed_delivery_count || 0);
-      const failedTotal = failedApi + failedDelivery;
 
-      // pending versi list: yang belum diproses API
-      // (accepted + apiError) dianggap sudah diproses
-      const processed = Number(r.processed_count || 0);
-      const pending = Math.max(total - processed, 0);
+      // ✅ Sent sesuai definisi kamu:
+      const sent = Math.max(total - failed - error, 0);
 
-      const label =
+      // pending OPTIONAL (kalau mau tetap ada)
+      // Dengan definisi "sent = sisa", pending biasanya 0 untuk broadcast yang sudah selesai.
+      // Jika broadcast masih berjalan dan kamu ingin pending real-time, nanti kita tambahkan logika queued/sending/attempt_count.
+      const pending = Math.max(total - (sent + failed + error), 0); // biasanya 0
+
+      const senderLabel =
         (r.verified_name && String(r.verified_name).trim()) ||
         (r.display_phone_number && String(r.display_phone_number).trim()) ||
         null;
@@ -1666,27 +1640,26 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
         status: r.status,
         template_name: r.template_name,
 
+        // totals
         total,
-
-        // ✅ UI baru
-        pending,
         sent,
         delivered,
         read,
-        failed_api: failedApi,
-        failed_delivery: failedDelivery,
-        failed_total: failedTotal,
-
-        // ✅ legacy: biar UI lama tetap “masuk akal”
-        // ok = sent (accepted), failed = failed_api (API error)
-        ok: sent,
-        failed: failedApi,
+        failed,
+        error,
+        pending,
 
         followup_count: Number(r.followup_count || 0),
 
         phone_number_id: r.phone_number_id || null,
         sender_phone: r.sender_phone || r.display_phone_number || null,
-        sender_label: label,
+        sender_label: senderLabel,
+
+        // legacy compatibility (kalau UI lama masih baca ok/failed)
+        ok: sent,
+        failed_total: failed + error,
+        failed_delivery: failed,
+        failed_api: error,
       };
     });
 
