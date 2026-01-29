@@ -1126,10 +1126,13 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       const cn = cleanStr(row.contactname);
       if (cn) varsMap.contactname = cn;
       
-      const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
-        const k = `var${idx + 1}`;
-        return varsMap[k] ?? "";
-      });
+      const varsForTemplate =
+        paramCount > 0
+          ? Array.from({ length: paramCount }, (_, idx) => {
+              const k = `var${idx + 1}`;
+              return cleanStr(varsMap[k]) || "-";   // jangan pernah kosong
+            })
+          : [];
 
       const mediaLink = cleanStr(row.follow_media);
       const mediaName = cleanStr(row.follow_media_filename) || cleanStr(row.filename);
@@ -1915,10 +1918,13 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
           : varsMapRaw;
       
-        const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
-          const k = `var${idx + 1}`;
-          return varsMap?.[k] != null ? String(varsMap[k]) : "";
-        });
+        const varsForTemplate =
+          paramCount > 0
+            ? Array.from({ length: paramCount }, (_, idx) => {
+                const k = `var${idx + 1}`;
+                return cleanStr(varsMap?.[k]) || "-";
+              })
+            : [];
       
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
