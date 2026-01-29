@@ -467,13 +467,22 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
   }
 
   const safeVars = Array.isArray(vars) ? vars : [];
-  components.push({
-    type: "body",
-    parameters: (safeVars.length ? safeVars : [""]).map((v) => ({
-      type: "text",
-      text: String(v ?? ""),
-    })),
-  });
+  
+  // ✅ hanya kirim BODY kalau memang ada parameter yang *berisi*
+  // (kalau template kamu tanpa variabel, vars akan [] -> BODY tidak dikirim)
+  const nonEmptyVars = safeVars
+    .map((v) => (v == null ? "" : String(v)).trim())
+    .filter((v) => v !== "");
+  
+  if (nonEmptyVars.length > 0) {
+    components.push({
+      type: "body",
+      parameters: nonEmptyVars.map((v) => ({
+        type: "text",
+        text: v,
+      })),
+    });
+  }
 
   const payload = {
     messaging_product: "whatsapp",
