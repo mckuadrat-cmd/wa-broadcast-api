@@ -22,7 +22,7 @@ const META_APP_ID = process.env.META_APP_ID || null;
 const WEBHOOK_VERIFY_TOKEN =
   process.env.WEBHOOK_VERIFY_TOKEN || "MCKUADRAT_WEBHOOK_TOKEN";
 
-// untuk endpoint run-scheduled
+// untuk endpoint run-scheduled / run-queue
 const CRON_SECRET = process.env.CRON_SECRET || "RANDOM_STRING_PANJANG";
 
 // fallback DEV / single-school
@@ -35,12 +35,8 @@ const ENV_DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || null;
 // =====================
 // SAFETY LOG
 // =====================
-process.on("uncaughtException", (err) => {
-  console.error("🔥 UNCAUGHT ERROR:", err);
-});
-process.on("unhandledRejection", (err) => {
-  console.error("🔥 UNHANDLED PROMISE:", err);
-});
+process.on("uncaughtException", (err) => console.error("🔥 UNCAUGHT ERROR:", err));
+process.on("unhandledRejection", (err) => console.error("🔥 UNHANDLED PROMISE:", err));
 
 // =====================
 // PG POOL (Railway)
@@ -334,6 +330,9 @@ async function getCtxByPhoneNumberId(phoneNumberId) {
   throw new Error("Tidak bisa resolve config dari phone_number_id");
 }
 
+// =====================
+// UTIL
+// =====================
 function cleanStr(v) {
   if (v === undefined || v === null) return "";
   const s = String(v).trim();
@@ -343,11 +342,27 @@ function cleanStr(v) {
   return s;
 }
 
-// =====================
-// UTIL
-// =====================
 function normPhone(s) {
   return String(s || "").replace(/\D/g, "");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeBackoffMs(attempts) {
+  // attempts setelah gagal: 1,2,3,...
+  // 1m, 5m, 15m
+  const minutes = attempts === 1 ? 1 : attempts === 2 ? 5 : 15;
+  return minutes * 60 * 1000;
+}
+
+async function isBroadcastCancelled(broadcastId) {
+  const { rows } = await pgPool.query(
+    `SELECT status FROM broadcasts WHERE id = $1 LIMIT 1`,
+    [broadcastId]
+  );
+  return String(rows[0]?.status || "").toLowerCase() === "cancelled";
 }
 
 async function getWabaPhoneNumbers(ctx) {
@@ -427,17 +442,6 @@ async function getDisplayPhoneByPhoneNumberId(schoolId, phoneNumberId) {
   return rows[0]?.display_phone_number || null;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function computeBackoffMs(attempts) {
-  // attempts setelah gagal: 1,2,3,...
-  // 1m, 5m, 15m
-  const minutes = attempts === 1 ? 1 : attempts === 2 ? 5 : 15;
-  return minutes * 60 * 1000;
-}
-
 // =====================
 // SENDERS
 // =====================
@@ -450,6 +454,7 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
 
   const components = [];
 
+  // HEADER doc
   if (headerDocument && headerDocument.link) {
     let filename = (headerDocument.filename || "").trim();
     if (!filename) filename = "document.pdf";
@@ -467,20 +472,15 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
   }
 
   const safeVars = Array.isArray(vars) ? vars : [];
-  
-  // ✅ hanya kirim BODY kalau memang ada parameter yang *berisi*
-  // (kalau template kamu tanpa variabel, vars akan [] -> BODY tidak dikirim)
   const nonEmptyVars = safeVars
     .map((v) => (v == null ? "" : String(v)).trim())
     .filter((v) => v !== "");
-  
+
+  // BODY hanya kalau ada parameter
   if (nonEmptyVars.length > 0) {
     components.push({
       type: "body",
-      parameters: nonEmptyVars.map((v) => ({
-        type: "text",
-        text: v,
-      })),
+      parameters: nonEmptyVars.map((v) => ({ type: "text", text: v })),
     });
   }
 
@@ -511,7 +511,6 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
       error: null,
     };
   } catch (err) {
-    // ✅ ini log yang kamu butuh
     console.log("❌ META_ERR sendWaTemplate");
     console.log("to:", normPhone(phone));
     console.log("template:", templateName, "lang:", langCode);
@@ -519,8 +518,7 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
     console.log("payload:", JSON.stringify(payload, null, 2));
     console.log("status:", err.response?.status);
     console.log("data:", JSON.stringify(err.response?.data || err.message, null, 2));
-
-    throw err; // penting: biar /broadcast bisa simpan error ke DB
+    throw err;
   }
 }
 
@@ -572,9 +570,7 @@ async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
 // =====================
 // ROUTES
 // =====================
-app.get("/", (req, res) => {
-  res.send("MCKuadrat WA Broadcast API — ONLINE ✅");
-});
+app.get("/", (req, res) => res.send("MCKuadrat WA Broadcast API — ONLINE ✅"));
 
 // ---------- AUTH LOGIN ----------
 app.post("/kirimpesan/auth/login", async (req, res) => {
@@ -690,7 +686,7 @@ app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
     const onlyConnected =
       String(req.query.only_connected || "").toLowerCase() === "1" ||
       String(req.query.only_connected || "").toLowerCase() === "true";
-    
+
     const filtered = onlyConnected
       ? rows.filter((r) => String(r.status || "").toUpperCase() === "CONNECTED")
       : rows;
@@ -719,9 +715,7 @@ app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
           );
         }
       }
-    } catch (_) {
-      // ignore kalau tabel belum ada
-    }
+    } catch (_) {}
 
     return res.json({ status: "ok", count: senders.length, senders });
   } catch (err) {
@@ -761,7 +755,7 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- UPLOAD SAMPLE (RESUMABLE HANDLE) ----------
+// ---------- UPLOAD SAMPLE ----------
 app.post("/kirimpesan/templates/upload-sample", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     const ctx = await getCtxByUserId(req.user.sub);
@@ -829,7 +823,6 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
       name,
       category,
       body_text,
-      example_1,
       footer_text,
       buttons,
       media_sample, // "DOCUMENT" | "IMAGE" | "VIDEO" | "NONE"
@@ -860,19 +853,14 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
 
     // ambil semua contoh variabel berurutan
     const bodyExamples = [];
-    
     if (req.body.examples && Array.isArray(req.body.examples)) {
-      req.body.examples.forEach((v) => {
-        bodyExamples.push(String(v));
-      });
+      req.body.examples.forEach((v) => bodyExamples.push(String(v)));
     }
-    
+
     components.push({
       type: "BODY",
       text: body_text,
-      ...(bodyExamples.length
-        ? { example: { body_text: [bodyExamples] } }
-        : {}),
+      ...(bodyExamples.length ? { example: { body_text: [bodyExamples] } } : {}),
     });
 
     if (footer_text) components.push({ type: "FOOTER", text: footer_text });
@@ -913,6 +901,45 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
   }
 });
 
+// ---------- CANCEL BROADCAST (FIX: route harus DI LUAR handler /broadcast) ----------
+app.post("/kirimpesan/broadcast/:id/cancel", authMiddleware, async (req, res) => {
+  try {
+    const schoolId = req.user.school_id;
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ status: "error", error: "id wajib" });
+
+    // 1) broadcast harus milik sekolah ini
+    const q = await pgPool.query(
+      `UPDATE broadcasts
+       SET status = 'cancelled',
+           cancelled_at = NOW(),
+           cancelled_by = $3
+       WHERE id = $1 AND school_id = $2
+       RETURNING id, status, cancelled_at`,
+      [id, schoolId, req.user?.name || req.user?.sub || "unknown"]
+    );
+
+    if (!q.rowCount) {
+      return res.status(404).json({ status: "error", error: "Broadcast tidak ditemukan" });
+    }
+
+    // 2) tandai recipients yang belum final jadi cancelled
+    await pgPool.query(
+      `UPDATE broadcast_recipients
+       SET status = 'cancelled',
+           status_updated_at = NOW()
+       WHERE broadcast_id = $1
+         AND LOWER(COALESCE(status,'')) NOT IN ('sent','delivered','read','failed','error','api_error','dead','cancelled')`,
+      [id]
+    );
+
+    return res.json({ status: "ok", broadcast_id: id, broadcast_status: "cancelled" });
+  } catch (err) {
+    console.error("Error cancel broadcast:", err);
+    return res.status(500).json({ status: "error", error: "Internal server error" });
+  }
+});
+
 // ---------- BROADCAST ----------
 app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
   try {
@@ -941,8 +968,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       }
     }
 
-    // broadcastId
-    const broadcastId = 
+    const broadcastId =
       (broadcast_id && String(broadcast_id).trim()) ||
       Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 
@@ -964,17 +990,14 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
     // pastikan sender_phone terisi display_phone_number (biar History bener)
     let effectiveSenderPhone = sender_phone ? String(sender_phone) : null;
-    
     if (!effectiveSenderPhone && effectivePhoneId && ctx.school_id) {
       const display = await getDisplayPhoneByPhoneNumberId(ctx.school_id, effectivePhoneId);
       if (display) effectiveSenderPhone = display;
     }
 
-
-    // ===== CREATE BROADCAST ROW (LOCK) =====
-    // status awal: scheduled / sending
+    // ===== CREATE BROADCAST ROW =====
     const initialStatus = isScheduled ? "scheduled" : "sending";
-    
+
     await pgPool.query(
       `INSERT INTO broadcasts (
          id, created_at, scheduled_at, status,
@@ -994,20 +1017,21 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       ]
     );
 
-    // mode scheduled: simpan recipients saja
+    // =====================
+    // MODE SCHEDULED
+    // =====================
     if (isScheduled) {
       for (const row of rows) {
+        if (await isBroadcastCancelled(broadcastId)) break;
+
         const phone = normPhone(row.phone || row.to);
         if (!phone) continue;
 
         const varsMap = {};
-        
-        // var1..varN tetap disimpan
         Object.keys(row)
           .filter((k) => /^var\d+$/.test(k) && row[k] != null && row[k] !== "")
           .forEach((k) => (varsMap[k] = row[k]));
-        
-        // ✅ simpan contactname juga (kalau ada)
+
         const cn = cleanStr(row.contactname);
         if (cn) varsMap.contactname = cn;
 
@@ -1035,7 +1059,7 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             Object.keys(varsMap).length ? varsMap : null,
             cleanStr(row.follow_media) || null,
             (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
-            scheduledDate, // next_attempt_at = scheduled_at (REAL schedule time)
+            scheduledDate, // next_attempt_at = scheduled_at
           ]
         );
       }
@@ -1049,15 +1073,17 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       });
     }
 
-    // =========================
-    // ✅ AUTO-QUEUE (IMMEDIATE)
-    // kalau banyak penerima, jangan kirim sync (biar gak timeout)
-    // =========================
-    if (!isScheduled && rows.length > DIRECT_SEND_LIMIT) {
-      // update broadcast status -> queued (tadi initialStatus = sending, kita koreksi)
-      await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [broadcastId]);
+    // =====================
+    // AUTO-QUEUE (IMMEDIATE) kalau penerima banyak
+    // =====================
+    if (rows.length > DIRECT_SEND_LIMIT) {
+      if (!(await isBroadcastCancelled(broadcastId))) {
+        await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [broadcastId]);
+      }
 
       for (const row of rows) {
+        if (await isBroadcastCancelled(broadcastId)) break;
+
         const phone = normPhone(row.phone || row.to);
         if (!phone) continue;
 
@@ -1107,39 +1133,38 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       });
     }
 
-    // mode langsung: kirim + simpan hasil
+    // =====================
+    // MODE LANGSUNG (SYNC)
+    // =====================
     const results = [];
 
     for (const row of rows) {
+      if (await isBroadcastCancelled(broadcastId)) break;
+
       const phone = normPhone(row.phone || row.to);
       if (!phone) continue;
 
-      // vars array dari row var1..varN
       const varsMap = {};
       for (let i = 1; i <= paramCount; i++) {
         const key = `var${i}`;
-        const val = row[key] == null ? "" : String(row[key]);
-        varsMap[key] = val;
+        varsMap[key] = row[key] == null ? "" : String(row[key]);
       }
-      
-      // ✅ simpan contactname (tidak tergantung paramCount)
+
       const cn = cleanStr(row.contactname);
       if (cn) varsMap.contactname = cn;
-      
+
       const varsForTemplate =
         paramCount > 0
           ? Array.from({ length: paramCount }, (_, idx) => {
               const k = `var${idx + 1}`;
-              return cleanStr(varsMap[k]) || "-";   // jangan pernah kosong
+              return cleanStr(varsMap[k]) || "-";
             })
           : [];
 
       const mediaLink = cleanStr(row.follow_media);
       const mediaName = cleanStr(row.follow_media_filename) || cleanStr(row.filename);
-      
-      const headerDocument = mediaLink
-        ? { link: mediaLink, filename: mediaName || null }
-        : null;
+
+      const headerDocument = mediaLink ? { link: mediaLink, filename: mediaName || null } : null;
 
       try {
         const r = await sendWaTemplate(ctx, {
@@ -1171,31 +1196,24 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
-            cleanStr(row.follow_media) || null,
-            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
+            mediaLink || null,
+            mediaName || null,
             r.messageId || null,
             r.status || null,
           ]
         );
-        } catch (err) {
-          console.log("❌ META_ERR /broadcast");
-          console.log("Status:", err.response?.status);
-          console.log(
-            "Data:",
-            JSON.stringify(err.response?.data || err.message, null, 2)
-          );
-        
-          const errorPayload = err.response?.data || err.message;
-        
-          results.push({
-            phone,
-            ok: false,
-            status: err.response?.status || 500,
-            messageId: null,
-            error: errorPayload,
-          });
-        
-          await pgPool.query(
+      } catch (err) {
+        const errorPayload = err.response?.data || err.message;
+
+        results.push({
+          phone,
+          ok: false,
+          status: err.response?.status || 500,
+          messageId: null,
+          error: errorPayload,
+        });
+
+        await pgPool.query(
           `INSERT INTO broadcast_recipients (
              id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
              status, attempts, next_attempt_at,
@@ -1213,10 +1231,10 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
             broadcastId,
             phone,
             Object.keys(varsMap).length ? varsMap : null,
-            cleanStr(row.follow_media) || null,
-            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
+            mediaLink || null,
+            mediaName || null,
             typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
-            err.response?.status || null,,
+            err.response?.status || null,
           ]
         );
       }
@@ -1228,7 +1246,10 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
 
     let finalStatus = "sent";
     if (ok === 0 && failed > 0) finalStatus = "failed";
-    await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [broadcastId, finalStatus]);
+
+    if (!(await isBroadcastCancelled(broadcastId))) {
+      await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [broadcastId, finalStatus]);
+    }
 
     return res.json({ status: "ok", broadcast_id: broadcastId, template_name, count: total, ok, failed, results });
   } catch (err) {
@@ -1243,12 +1264,8 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
     const { to, text, media, phone_number_id, broadcast_id } = req.body || {};
 
-    if (!to) {
-      return res.status(400).json({ status: "error", error: "`to` wajib diisi" });
-    }
-    if (!text && !media) {
-      return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
-    }
+    if (!to) return res.status(400).json({ status: "error", error: "`to` wajib diisi" });
+    if (!text && !media) return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
 
     const waRes = await sendCustomMessage(ctx, { to, text, media, phone_number_id });
 
@@ -1266,9 +1283,9 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
           media ? "outgoing_media" : "outgoing",
           text || null,
           false,
-          broadcast_id || null,                 // optional: kalau memang terkait broadcast tertentu
+          broadcast_id || null,
           JSON.stringify(waRes || {}),
-          phone_number_id || ctx.phone_number_id || null, // biar ter-scope di inbox
+          phone_number_id || ctx.phone_number_id || null,
         ]
       );
     } catch (dbErr) {
@@ -1278,10 +1295,7 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
     return res.json({ status: "ok", to, wa_response: waRes });
   } catch (err) {
     console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
-    return res.status(500).json({
-      status: "error",
-      error: err.response?.data || err.message,
-    });
+    return res.status(500).json({ status: "error", error: err.response?.data || err.message });
   }
 });
 
@@ -1311,22 +1325,19 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const statuses = value?.statuses;
     const messages = value?.messages;
 
-    // =========================
-    // ✅ DELIVERY STATUS (REAL)
-    // =========================
+    // ✅ DELIVERY STATUS
     if (statuses && Array.isArray(statuses) && statuses.length) {
       for (const st of statuses) {
         const msgId = st?.id || null;
-        const stStatus = String(st?.status || "").toLowerCase(); // sent|delivered|read|failed
+        const stStatus = String(st?.status || "").toLowerCase();
         if (!msgId || !stStatus) continue;
-    
+
         const errPayload = st?.errors || null;
-    
-        // pilih kolom timestamp yang mau diisi
+
         const deliveredAt = stStatus === "delivered" ? "NOW()" : "NULL";
-        const readAt      = stStatus === "read"      ? "NOW()" : "NULL";
-        const failedAt    = stStatus === "failed"    ? "NOW()" : "NULL";
-    
+        const readAt = stStatus === "read" ? "NOW()" : "NULL";
+        const failedAt = stStatus === "failed" ? "NOW()" : "NULL";
+
         await pgPool.query(
           `
           UPDATE broadcast_recipients
@@ -1358,7 +1369,7 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       else if (msg.interactive.list_reply) triggerText = msg.interactive.list_reply.title || msg.interactive.list_reply.id || "";
     }
 
-    // query terakhir broadcast+recipient utk nomor ini (buat vars + media + followup_config)
+    // ambil broadcast terakhir untuk nomor ini
     const q = await pgPool.query(
       `
       SELECT
@@ -1378,26 +1389,24 @@ app.post("/kirimpesan/webhook", async (req, res) => {
       [from]
     );
 
+    // media incoming
     let mediaType = null;
     let mediaId = null;
     let mediaCaption = null;
-    
+
     if (msg.type === "image") {
       mediaType = "image";
       mediaId = msg.image?.id || null;
       mediaCaption = msg.image?.caption || null;
-    }
-    else if (msg.type === "video") {
+    } else if (msg.type === "video") {
       mediaType = "video";
       mediaId = msg.video?.id || null;
       mediaCaption = msg.video?.caption || null;
-    }
-    else if (msg.type === "document") {
+    } else if (msg.type === "document") {
       mediaType = "document";
       mediaId = msg.document?.id || null;
       mediaCaption = msg.document?.caption || null;
-    }
-    else if (msg.type === "audio") {
+    } else if (msg.type === "audio") {
       mediaType = "audio";
       mediaId = msg.audio?.id || null;
     }
@@ -1405,36 +1414,20 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const row = q.rows[0] || null;
     const broadcastId = row?.broadcast_id || null;
 
-    // simpan inbox_messages (best-effort)
+    // simpan inbox
     try {
       const isQuickReply = !!triggerText && (msg.type === "button" || msg.type === "interactive");
-    
+
       await pgPool.query(
         `INSERT INTO inbox_messages (
-          at,
-          phone,
-          message_type,
-          message_text,
-          media_type,
-          media_id,
-          media_caption,
-          raw_json,
-          broadcast_id,
-          is_quick_reply,
-          phone_number_id
+          at, phone, message_type, message_text,
+          media_type, media_id, media_caption,
+          raw_json, broadcast_id, is_quick_reply, phone_number_id
         )
         VALUES (
-          NOW(),
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          $10
+          NOW(), $1, $2, $3,
+          $4, $5, $6,
+          $7, $8, $9, $10
         )`,
         [
           from,
@@ -1461,12 +1454,9 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     // followup_config harus ada
     let followupConfig = row?.followup_config || null;
     if (typeof followupConfig === "string") {
-      try { followupConfig = JSON.parse(followupConfig); } catch { /* ignore */ }
+      try { followupConfig = JSON.parse(followupConfig); } catch {}
     }
-    if (!followupConfig || !followupConfig.text) {
-      console.log("No followup config, ignore.");
-      return res.sendStatus(200);
-    }
+    if (!followupConfig || !followupConfig.text) return res.sendStatus(200);
 
     const varsMap = row?.vars_json || {};
     const text = applyFollowupTemplate(followupConfig.text, varsMap);
@@ -1501,10 +1491,7 @@ app.post("/kirimpesan/webhook", async (req, res) => {
         phone_number_id: phoneNumberId || row?.broadcast_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
       };
     }
-    if (!followCtx.wa_token) {
-      console.warn("Token WA tidak tersedia; follow-up tidak bisa dikirim.");
-      return res.sendStatus(200);
-    }
+    if (!followCtx.wa_token) return res.sendStatus(200);
 
     try {
       const waRes = await sendCustomMessage(followCtx, {
@@ -1554,13 +1541,6 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
 // =====================
 // BROADCAST LOGS (SCOPED SCHOOL)
-// GET /kirimpesan/broadcast/logs?limit=50
-// Definisi (sesuai kamu):
-// - Error     : gagal API (request ditolak), tidak pernah accepted
-// - Failed    : gagal delivery (failed_at / status failed/dead/undelivered)
-// - Delivered : delivered_at != null
-// - Read      : read_at != null
-// - Sent      : total - Failed - Error
 // =====================
 app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
   try {
@@ -1579,7 +1559,6 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
 
         COUNT(br.id) AS total,
 
-        -- ✅ Error: gagal API (ditolak) + belum pernah accepted
         COUNT(br.id) FILTER (
           WHERE
             (
@@ -1592,13 +1571,11 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
             AND br.sent_at IS NULL
         ) AS error_count,
 
-        -- ✅ Failed: gagal delivery (setelah accepted / status fail)
         COUNT(br.id) FILTER (
           WHERE br.failed_at IS NOT NULL
              OR LOWER(COALESCE(br.status,'')) IN ('failed','dead','undelivered')
         ) AS failed_count,
 
-        -- ✅ Delivered/Read dari webhook
         COUNT(br.id) FILTER (WHERE br.delivered_at IS NOT NULL) AS delivered_count,
         COUNT(br.id) FILTER (WHERE br.read_at IS NOT NULL)      AS read_count,
 
@@ -1607,18 +1584,13 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
         spn.display_phone_number,
         spn.verified_name
       FROM broadcasts b
-      LEFT JOIN broadcast_recipients br
-        ON br.broadcast_id = b.id
-      LEFT JOIN broadcast_followups bf
-        ON bf.broadcast_id = b.id
+      LEFT JOIN broadcast_recipients br ON br.broadcast_id = b.id
+      LEFT JOIN broadcast_followups bf ON bf.broadcast_id = b.id
       LEFT JOIN school_phone_numbers spn
         ON spn.school_id = b.school_id
        AND spn.phone_number_id = b.phone_number_id
       WHERE b.school_id = $1
-      GROUP BY
-        b.id,
-        spn.display_phone_number,
-        spn.verified_name
+      GROUP BY b.id, spn.display_phone_number, spn.verified_name
       ORDER BY b.created_at DESC
       LIMIT $2
     `;
@@ -1632,13 +1604,8 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
       const delivered = Number(r.delivered_count || 0);
       const read = Number(r.read_count || 0);
 
-      // ✅ Sent sesuai definisi kamu:
       const sent = Math.max(total - failed - error, 0);
-
-      // pending OPTIONAL (kalau mau tetap ada)
-      // Dengan definisi "sent = sisa", pending biasanya 0 untuk broadcast yang sudah selesai.
-      // Jika broadcast masih berjalan dan kamu ingin pending real-time, nanti kita tambahkan logika queued/sending/attempt_count.
-      const pending = Math.max(total - (sent + failed + error), 0); // biasanya 0
+      const pending = Math.max(total - (sent + failed + error), 0);
 
       const senderLabel =
         (r.verified_name && String(r.verified_name).trim()) ||
@@ -1651,8 +1618,6 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
         scheduled_at: r.scheduled_at,
         status: r.status,
         template_name: r.template_name,
-
-        // totals
         total,
         sent,
         delivered,
@@ -1660,14 +1625,10 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
         failed,
         error,
         pending,
-
         followup_count: Number(r.followup_count || 0),
-
         phone_number_id: r.phone_number_id || null,
         sender_phone: r.sender_phone || r.display_phone_number || null,
         sender_label: senderLabel,
-
-        // legacy compatibility (kalau UI lama masih baca ok/failed)
         ok: sent,
         failed_total: failed + error,
         failed_delivery: failed,
@@ -1678,16 +1639,12 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
     return res.json({ status: "ok", logs });
   } catch (e) {
     console.error("Error /kirimpesan/broadcast/logs:", e);
-    return res.status(500).json({
-      status: "error",
-      message: "Gagal memuat logs",
-    });
+    return res.status(500).json({ status: "error", message: "Gagal memuat logs" });
   }
 });
 
 // =====================
 // BROADCAST LOG DETAIL (SCOPED SCHOOL)
-// GET /kirimpesan/broadcast/logs/:id
 // =====================
 app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
   try {
@@ -1695,18 +1652,11 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ status: "error", error: "id wajib" });
 
-    // 1) ambil broadcast (harus milik sekolah ini)
     const bcQ = await pgPool.query(
       `
       SELECT
-        id,
-        created_at,
-        scheduled_at,
-        status,
-        template_name,
-        sender_phone,
-        phone_number_id,
-        followup_enabled
+        id, created_at, scheduled_at, status,
+        template_name, sender_phone, phone_number_id, followup_enabled
       FROM broadcasts
       WHERE id = $1 AND school_id = $2
       LIMIT 1
@@ -1720,25 +1670,15 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
 
     const broadcast = bcQ.rows[0];
 
-    // 2) recipients
     const recQ = await pgPool.query(
       `
       SELECT
-        phone,
-        vars_json,
-        follow_media,
-        follow_media_filename,
-        status,
-        attempts,
-        next_attempt_at,
-        last_error,
-        meta_message_id,
-        sent_at,
-        last_attempt_at,
-        attempt_count,
-        template_ok,
-        template_http_status,
-        template_error
+        phone, vars_json, follow_media, follow_media_filename,
+        status, attempts, next_attempt_at,
+        last_error, meta_message_id,
+        sent_at, last_attempt_at, attempt_count,
+        template_ok, template_http_status, template_error,
+        delivered_at, read_at, failed_at
       FROM broadcast_recipients
       WHERE broadcast_id = $1
       ORDER BY created_at ASC
@@ -1746,16 +1686,9 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
       [id]
     );
 
-    // 3) followups
     const folQ = await pgPool.query(
       `
-      SELECT
-        phone,
-        at,
-        has_media,
-        media_link,
-        status,
-        error
+      SELECT phone, at, has_media, media_link, status, error
       FROM broadcast_followups
       WHERE broadcast_id = $1
       ORDER BY at ASC
@@ -1765,11 +1698,7 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
 
     return res.json({
       status: "ok",
-      log: {
-        broadcast,
-        recipients: recQ.rows || [],
-        followups: folQ.rows || [],
-      },
+      log: { broadcast, recipients: recQ.rows || [], followups: folQ.rows || [] },
     });
   } catch (e) {
     console.error("Error /kirimpesan/broadcast/logs/:id:", e);
@@ -1786,9 +1715,7 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
     const schoolId = req.user.school_id;
     const phoneNumberId = req.query.phone_number_id ? String(req.query.phone_number_id) : null;
 
-    if (phoneNumberId) {
-      await assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId);
-    }
+    if (phoneNumberId) await assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId);
 
     const sql = `
       SELECT
@@ -1838,9 +1765,7 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
 // =====================
 app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
   const secret = req.headers["x-cron-secret"] || req.query.secret;
-  if (secret !== CRON_SECRET) {
-    return res.status(403).json({ status: "error", error: "Forbidden" });
-  }
+  if (secret !== CRON_SECRET) return res.status(403).json({ status: "error", error: "Forbidden" });
 
   try {
     const { rows: broadcasts } = await pgPool.query(
@@ -1856,13 +1781,17 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
     const ran = [];
 
     for (const bc of broadcasts) {
+      if (await isBroadcastCancelled(bc.id)) continue;
+
       const { rows: recipients } = await pgPool.query(
         `SELECT * FROM broadcast_recipients WHERE broadcast_id = $1`,
         [bc.id]
       );
 
       if (!recipients.length) {
-        await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
+        if (!(await isBroadcastCancelled(bc.id))) {
+          await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
+        }
         ran.push({ broadcast_id: bc.id, total: 0, ok: 0, failed: 0 });
         continue;
       }
@@ -1884,10 +1813,7 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         };
       }
 
-      if (!ctx.wa_token || !ctx.waba_id) {
-        console.warn("ctx WA tidak tersedia; run-scheduled skip broadcast:", bc.id);
-        continue;
-      }
+      if (!ctx.wa_token || !ctx.waba_id) continue;
 
       const { paramCount, language } = await getTemplateMetadata(ctx, bc.template_name);
 
@@ -1895,10 +1821,11 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       let failCount = 0;
 
       for (const rcp of recipients) {
+        if (await isBroadcastCancelled(bc.id)) break;
+
         const phone = rcp.phone;
         if (!phone) continue;
 
-        // mark attempt -> sending
         try {
           await pgPool.query(
             `UPDATE broadcast_recipients
@@ -1911,13 +1838,13 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
             [rcp.id]
           );
         } catch (_) {}
-      
-        // ✅ ambil dari DB (broadcast_recipients.vars_json)
+
         const varsMapRaw = rcp.vars_json || {};
-        const varsMap = typeof varsMapRaw === "string"
-          ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
-          : varsMapRaw;
-      
+        const varsMap =
+          typeof varsMapRaw === "string"
+            ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
+            : varsMapRaw;
+
         const varsForTemplate =
           paramCount > 0
             ? Array.from({ length: paramCount }, (_, idx) => {
@@ -1925,14 +1852,11 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
                 return cleanStr(varsMap?.[k]) || "-";
               })
             : [];
-      
+
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
-      
-        const headerDocument = mediaLink
-          ? { link: mediaLink, filename: mediaName || null }
-          : null;
-      
+        const headerDocument = mediaLink ? { link: mediaLink, filename: mediaName || null } : null;
+
         try {
           const r = await sendWaTemplate(ctx, {
             phone,
@@ -1942,29 +1866,27 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
             phone_number_id: bc.phone_number_id || undefined,
             headerDocument,
           });
-      
-          okCount++;
-      
-            await pgPool.query(
-              `UPDATE broadcast_recipients
-                  SET status = 'sent',
-                      status_updated_at = NOW(),
-                      meta_message_id = $2,
-                      api_accepted_at = NOW(),
-                      sent_at = NOW(),
-                      template_ok = TRUE,
-                      template_http_status = $3,
-                      template_error = NULL,
-                      last_error = NULL
-                WHERE id = $1`,
-              [rcp.id, r.messageId || null, r.status || null]
-            );
 
+          okCount++;
+
+          await pgPool.query(
+            `UPDATE broadcast_recipients
+                SET status = 'sent',
+                    status_updated_at = NOW(),
+                    meta_message_id = $2,
+                    api_accepted_at = NOW(),
+                    sent_at = NOW(),
+                    template_ok = TRUE,
+                    template_http_status = $3,
+                    template_error = NULL,
+                    last_error = NULL
+              WHERE id = $1`,
+            [rcp.id, r.messageId || null, r.status || null]
+          );
         } catch (err) {
-          failCount++; // ✅ ini sebelumnya gak pernah naik
-      
+          failCount++;
           const errorPayload = err.response?.data || err.message;
-      
+
           await pgPool.query(
             `UPDATE broadcast_recipients
                 SET status = 'failed',
@@ -1984,8 +1906,10 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         }
       }
 
-      await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
-      ran.push({ broadcast_id: bc.id, total: recipients.length, ok: okCount, failed: failCount });
+      if (!(await isBroadcastCancelled(bc.id))) {
+        await pgPool.query(`UPDATE broadcasts SET status = 'sent' WHERE id = $1`, [bc.id]);
+        ran.push({ broadcast_id: bc.id, total: recipients.length, ok: okCount, failed: failCount });
+      }
     }
 
     return res.json({ status: "ok", ran });
@@ -1997,28 +1921,25 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
 
 // =====================
 // RUN QUEUE (IMMEDIATE JOBS)
-// GET /kirimpesan/broadcast/run-queue?secret=...&limit=100&delay=400&max_broadcasts=5
 // =====================
 app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
   const secret = req.headers["x-cron-secret"] || req.query.secret;
-  if (secret !== CRON_SECRET) {
-    return res.status(403).json({ status: "error", error: "Forbidden" });
-  }
+  if (secret !== CRON_SECRET) return res.status(403).json({ status: "error", error: "Forbidden" });
 
-  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);      // batch recipients per broadcast
-  const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);     // jeda per pesan (ms)
-  const pauseEvery = Math.min(parseInt(req.query.pause_every || "50", 10), 1000); // tiap N pesan
-  const pauseMs = Math.min(parseInt(req.query.pause_ms || "5000", 10), 60000);     // lama pause (ms)
+  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+  const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);
+  const pauseEvery = Math.min(parseInt(req.query.pause_every || "50", 10), 1000);
+  const pauseMs = Math.min(parseInt(req.query.pause_ms || "5000", 10), 60000);
   const maxBroadcasts = Math.min(parseInt(req.query.max_broadcasts || "5", 10), 20);
   const maxAttempts = Math.min(parseInt(req.query.max_attempts || "3", 10), 10);
 
   try {
-    // Ambil beberapa broadcast yang sedang antri
     const { rows: broadcasts } = await pgPool.query(
       `
       SELECT *
       FROM broadcasts
       WHERE status IN ('queued','sending')
+        AND LOWER(status) <> 'cancelled'
       ORDER BY created_at ASC
       LIMIT $1
       `,
@@ -2030,7 +1951,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
     const ran = [];
 
     for (const bc of broadcasts) {
-      // Resolve ctx (token, waba, version)
+      if (await isBroadcastCancelled(bc.id)) continue;
+
+      // Resolve ctx
       let ctx = null;
       try {
         if (bc.school_id) ctx = await getCtxBySchoolId(bc.school_id);
@@ -2048,27 +1971,24 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         };
       }
 
-      if (!ctx.wa_token || !ctx.waba_id) {
-        console.warn("ctx WA tidak tersedia; run-queue skip broadcast:", bc.id);
-        continue;
-      }
+      if (!ctx.wa_token || !ctx.waba_id) continue;
 
-      // Metadata template sekali per broadcast
       const { paramCount, language } = await getTemplateMetadata(ctx, bc.template_name);
 
-      // 1) Ambil batch recipients secara aman pakai SKIP LOCKED
       const client = await pgPool.connect();
       let batch = [];
 
       try {
         await client.query("BEGIN");
 
-        // Mark broadcast as sending (biar kelihatan aktif)
-        await client.query(`UPDATE broadcasts SET status = 'sending' WHERE id = $1`, [bc.id]);
+        if (!(await isBroadcastCancelled(bc.id))) {
+          await client.query(`UPDATE broadcasts SET status = 'sending' WHERE id = $1`, [bc.id]);
+        }
 
         const recQ = await client.query(
           `
-          SELECT id, phone, vars_json, follow_media, follow_media_filename, attempts
+          SELECT id, phone, vars_json, follow_media, follow_media_filename,
+                 attempts, attempt_count, next_attempt_at
           FROM broadcast_recipients
           WHERE broadcast_id = $1
             AND status IN ('queued','error')
@@ -2084,8 +2004,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
 
         if (!batch.length) {
           await client.query("COMMIT");
+          client.release();
 
-          // Kalau gak ada yang bisa diproses sekarang, cek apakah masih ada queued/error yang nunggu waktu
+          // cek sisa
           const leftQ = await pgPool.query(
             `
             SELECT
@@ -2103,70 +2024,70 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           const sentCount = leftQ.rows[0]?.sent_count || 0;
 
           if (leftActive === 0) {
-            // selesai
             const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
             await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
           } else {
-            // masih ada tapi nunggu next_attempt_at -> biarkan status sending/queued? kita set queued biar rapi
-            await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+            if (!(await isBroadcastCancelled(bc.id))) {
+              await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+            }
           }
 
           ran.push({ broadcast_id: bc.id, picked: 0, ok: 0, failed: 0, note: "no-eligible-batch" });
           continue;
         }
 
-        // Mark recipients batch -> sending
+        // mark batch -> sending
         const ids = batch.map((r) => r.id);
         await client.query(
           `
-            UPDATE broadcast_recipients
-            SET status = 'sending',
-                sending_at = NOW(),
-                status_updated_at = NOW(),
-                last_attempt_at = NOW(),
-                attempt_count = attempt_count + 1
-            WHERE id = ANY($1::uuid[])
+          UPDATE broadcast_recipients
+          SET status = 'sending',
+              sending_at = NOW(),
+              status_updated_at = NOW(),
+              last_attempt_at = NOW(),
+              attempt_count = attempt_count + 1
+          WHERE id = ANY($1::uuid[])
           `,
           [ids]
         );
 
         await client.query("COMMIT");
+        client.release();
       } catch (e) {
         try { await client.query("ROLLBACK"); } catch {}
         client.release();
         console.error("run-queue tx error:", e);
         continue;
-      } finally {
-        client.release();
       }
 
-      // 2) Kirim satu-satu + delay + retry/backoff
       let okCount = 0;
       let failCount = 0;
       let sentCounter = 0;
-      
+
       for (const rcp of batch) {
+        if (await isBroadcastCancelled(bc.id)) break;
+
         const phone = rcp.phone;
         if (!phone) continue;
-      
+
         const varsMapRaw = rcp.vars_json || {};
         const varsMap =
           typeof varsMapRaw === "string"
             ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
             : varsMapRaw;
-      
-        const varsForTemplate = Array.from({ length: paramCount }, (_, idx) => {
-          const k = `var${idx + 1}`;
-          return varsMap?.[k] != null ? String(varsMap[k]) : "";
-        });
-      
+
+        const varsForTemplate =
+          paramCount > 0
+            ? Array.from({ length: paramCount }, (_, idx) => {
+                const k = `var${idx + 1}`;
+                return cleanStr(varsMap?.[k]) || "-";
+              })
+            : [];
+
         const mediaLink = cleanStr(rcp.follow_media);
         const mediaName = cleanStr(rcp.follow_media_filename);
-      
-        const headerDocument = mediaLink
-          ? { link: mediaLink, filename: mediaName || null }
-          : null;
-      
+        const headerDocument = mediaLink ? { link: mediaLink, filename: mediaName || null } : null;
+
         try {
           const r = await sendWaTemplate(ctx, {
             phone,
@@ -2176,9 +2097,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
             phone_number_id: bc.phone_number_id || undefined,
             headerDocument,
           });
-      
+
           okCount++;
-      
+
           await pgPool.query(
             `UPDATE broadcast_recipients
                 SET status = 'sent',
@@ -2195,45 +2116,42 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           );
         } catch (err) {
           failCount++;
-      
+
           const errorPayload = err.response?.data || err.message;
-          const currentAttempts = (rcp.attempts || 0) + 1;
-      
+          const prevAttempts = Number(rcp.attempt_count || rcp.attempts || 0);
+          const currentAttempts = prevAttempts + 1;
+
           const shouldDead = currentAttempts >= maxAttempts;
-          const nextAttemptAt = shouldDead
-            ? null
-            : new Date(Date.now() + computeBackoffMs(currentAttempts));
-      
+          const nextAttemptAt = shouldDead ? null : new Date(Date.now() + computeBackoffMs(currentAttempts));
+
           await pgPool.query(
             `UPDATE broadcast_recipients
-                SET status = 'failed',
+                SET status = $2,
                     status_updated_at = NOW(),
-                    failed_at = NOW(),
+                    failed_at = CASE WHEN $2='dead' THEN NOW() ELSE failed_at END,
+                    next_attempt_at = $3,
+                    attempts = $4,
                     template_ok = FALSE,
-                    template_http_status = $2,
-                    template_error = $3,
-                    last_error = $3
+                    template_http_status = $5,
+                    template_error = $6,
+                    last_error = $6
               WHERE id = $1`,
             [
               rcp.id,
+              shouldDead ? "dead" : "error",
+              nextAttemptAt,
+              currentAttempts,
               err.response?.status || null,
               typeof errorPayload === "string" ? { message: errorPayload } : errorPayload,
             ]
           );
         }
-      
+
         sentCounter++;
-      
-        // ✅ micro delay tiap pesan
         if (delay > 0) await sleep(delay);
-      
-        // ✅ burst pause tiap N pesan
-        if (pauseEvery > 0 && sentCounter % pauseEvery === 0) {
-          await sleep(pauseMs);
-        }
+        if (pauseEvery > 0 && sentCounter % pauseEvery === 0) await sleep(pauseMs);
       }
 
-      // 3) Setelah batch, cek sisa. Kalau selesai -> mark broadcast final
       const leftQ = await pgPool.query(
         `
         SELECT
@@ -2254,8 +2172,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
         await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
       } else {
-        // Masih ada kerjaan -> balikkan ke queued agar cron lanjutin
-        await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+        if (!(await isBroadcastCancelled(bc.id))) {
+          await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
+        }
       }
 
       ran.push({
