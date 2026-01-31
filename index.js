@@ -32,24 +32,38 @@ const ENV_WA_VERSION = process.env.WA_VERSION || "v24.0";
 const ENV_TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || "en";
 const ENV_DEFAULT_PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || null;
 
+const DIRECT_SEND_LIMIT = parseInt(process.env.DIRECT_SEND_LIMIT || "200", 10);
+
 // =====================
 // SAFETY LOG
 // =====================
-process.on("uncaughtException", (err) => console.error("🔥 UNCAUGHT ERROR:", err));
-process.on("unhandledRejection", (err) => console.error("🔥 UNHANDLED PROMISE:", err));
+process.on("uncaughtException", (err) =>
+  console.error("🔥 UNCAUGHT ERROR:", err)
+);
+process.on("unhandledRejection", (err) =>
+  console.error("🔥 UNHANDLED PROMISE:", err)
+);
 
 // =====================
 // PG POOL (Railway)
 // =====================
 const pgPool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
 // =====================
 // MIDDLEWARE
 // =====================
-app.use(cors());
+app.set("trust proxy", 1);
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
@@ -58,6 +72,32 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 },
 });
+
+// tiny request id + log
+app.use((req, _res, next) => {
+  req._rid =
+    Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7);
+  next();
+});
+
+// =====================
+// HELPERS
+// =====================
+function ok(res, data) {
+  return res.json({ status: "ok", ...data });
+}
+
+function errRes(res, code, message, extra) {
+  return res.status(code).json({
+    status: "error",
+    error: message,
+    ...(extra ? extra : {}),
+  });
+}
+
+function wrapAsync(fn) {
+  return (req, res, next) => fn(req, res, next).catch(next);
+}
 
 // =====================
 // AUTH HELPERS
@@ -80,7 +120,7 @@ function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || "";
   const [scheme, token] = auth.split(" ");
   if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ status: "error", error: "Unauthorized (no token)" });
+    return errRes(res, 401, "Unauthorized (no token)");
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -88,14 +128,14 @@ function authMiddleware(req, res, next) {
     return next();
   } catch (err) {
     console.error("JWT verify error:", err.message);
-    return res.status(401).json({ status: "error", error: "Invalid or expired token" });
+    return errRes(res, 401, "Invalid or expired token");
   }
 }
 
 function requireAdmin(req, res, next) {
   const role = (req.user?.role || "").toLowerCase();
   if (role !== "admin" && role !== "superadmin") {
-    return res.status(403).json({ status: "error", error: "Forbidden (admin only)" });
+    return errRes(res, 403, "Forbidden (admin only)");
   }
   next();
 }
@@ -110,7 +150,8 @@ async function assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId) {
       LIMIT 1`,
     [schoolId, String(phoneNumberId)]
   );
-  if (!rows.length) throw new Error("phone_number_id tidak terdaftar untuk sekolah ini");
+  if (!rows.length)
+    throw new Error("phone_number_id tidak terdaftar untuk sekolah ini");
   return true;
 }
 
@@ -166,7 +207,9 @@ async function getCtxByUserId(userId) {
     };
   }
 
-  throw new Error("School config tidak ditemukan untuk user ini (dan ENV fallback tidak tersedia)");
+  throw new Error(
+    "School config tidak ditemukan untuk user ini (dan ENV fallback tidak tersedia)"
+  );
 }
 
 async function getCtxBySchoolId(schoolId) {
@@ -204,7 +247,8 @@ async function getCtxBySchoolId(schoolId) {
       wa_token: s.wa_token,
       wa_version: s.wa_version || ENV_WA_VERSION,
       template_lang: s.template_lang || ENV_TEMPLATE_LANG,
-      default_phone_number_id: s.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+      default_phone_number_id:
+        s.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
       phone_number_id: s.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
     };
   }
@@ -269,7 +313,8 @@ async function getCtxByPhoneNumberId(phoneNumberId) {
         wa_token: r.wa_token,
         wa_version: r.wa_version || ENV_WA_VERSION,
         template_lang: r.template_lang || ENV_TEMPLATE_LANG,
-        default_phone_number_id: r.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+        default_phone_number_id:
+          r.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
         phone_number_id: String(phoneNumberId),
       };
     }
@@ -310,7 +355,8 @@ async function getCtxByPhoneNumberId(phoneNumberId) {
       wa_token: s.wa_token,
       wa_version: s.wa_version || ENV_WA_VERSION,
       template_lang: s.template_lang || ENV_TEMPLATE_LANG,
-      default_phone_number_id: s.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+      default_phone_number_id:
+        s.default_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
       phone_number_id: String(phoneNumberId),
     };
   }
@@ -362,7 +408,8 @@ async function isBroadcastCancelled(broadcastId) {
     `SELECT status FROM broadcasts WHERE id = $1 LIMIT 1`,
     [broadcastId]
   );
-  return String(rows[0]?.status || "").toLowerCase() === "cancelled";
+  if (!rows.length) return true; // anggap stop kalau broadcast hilang
+  return String(rows[0].status || "").toLowerCase() === "cancelled";
 }
 
 async function getWabaPhoneNumbers(ctx) {
@@ -401,7 +448,10 @@ async function getTemplateMetadata(ctx, templateName) {
 
     return { paramCount, language: t.language || ctx.template_lang || "en" };
   } catch (err) {
-    console.error("Gagal ambil template metadata:", err.response?.data || err.message);
+    console.error(
+      "Gagal ambil template metadata:",
+      err.response?.data || err.message
+    );
     return { paramCount: 0, language: ctx.template_lang || "en" };
   }
 }
@@ -445,8 +495,19 @@ async function getDisplayPhoneByPhoneNumberId(schoolId, phoneNumberId) {
 // =====================
 // SENDERS
 // =====================
-async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars, phone_number_id, headerDocument }) {
-  const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
+async function sendWaTemplate(
+  ctx,
+  {
+    phone,
+    templateName,
+    templateLanguage,
+    vars,
+    phone_number_id,
+    headerDocument,
+  }
+) {
+  const phoneId =
+    phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
   if (!phoneId) throw new Error("PHONE_NUMBER_ID belum tersedia");
 
   const url = `https://graph.facebook.com/${ctx.wa_version}/${phoneId}/messages`;
@@ -511,22 +572,27 @@ async function sendWaTemplate(ctx, { phone, templateName, templateLanguage, vars
       error: null,
     };
   } catch (err) {
+    // log detail yang berguna tapi gak lebay
     console.log("❌ META_ERR sendWaTemplate");
     console.log("to:", normPhone(phone));
     console.log("template:", templateName, "lang:", langCode);
     console.log("url:", url);
-    console.log("payload:", JSON.stringify(payload, null, 2));
     console.log("status:", err.response?.status);
-    console.log("data:", JSON.stringify(err.response?.data || err.message, null, 2));
+    console.log(
+      "data:",
+      JSON.stringify(err.response?.data || err.message, null, 2)
+    );
     throw err;
   }
 }
 
 async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
-  const phoneId = phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
+  const phoneId =
+    phone_number_id || ctx.phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID;
   if (!phoneId) throw new Error("PHONE_NUMBER_ID belum tersedia");
 
   const url = `https://graph.facebook.com/${ctx.wa_version}/${phoneId}/messages`;
+  const toNorm = normPhone(to);
 
   let body;
   if (media && media.type && media.link) {
@@ -539,14 +605,14 @@ async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
 
       body = {
         messaging_product: "whatsapp",
-        to,
+        to: toNorm,
         type: "document",
         document: { link: media.link, filename, ...(text ? { caption: text } : {}) },
       };
     } else {
       body = {
         messaging_product: "whatsapp",
-        to,
+        to: toNorm,
         type: mType,
         [mType]: { link: media.link, ...(text ? { caption: text } : {}) },
       };
@@ -554,14 +620,17 @@ async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
   } else {
     body = {
       messaging_product: "whatsapp",
-      to,
+      to: toNorm,
       type: "text",
       text: { body: text || "", preview_url: false },
     };
   }
 
   const resp = await axios.post(url, body, {
-    headers: { Authorization: `Bearer ${ctx.wa_token}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${ctx.wa_token}`,
+      "Content-Type": "application/json",
+    },
   });
 
   return resp.data;
@@ -570,14 +639,15 @@ async function sendCustomMessage(ctx, { to, text, media, phone_number_id }) {
 // =====================
 // ROUTES
 // =====================
-app.get("/", (req, res) => res.send("MCKuadrat WA Broadcast API — ONLINE ✅"));
+app.get("/", (_req, res) => res.send("MCKuadrat WA Broadcast API — ONLINE ✅"));
 
 // ---------- AUTH LOGIN ----------
-app.post("/kirimpesan/auth/login", async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/auth/login",
+  wrapAsync(async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) {
-      return res.status(400).json({ status: "error", error: "Username dan password wajib diisi" });
+      return errRes(res, 400, "Username dan password wajib diisi");
     }
 
     const uname = String(username).trim().toLowerCase();
@@ -603,7 +673,7 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
     );
 
     if (!rows.length) {
-      return res.status(401).json({ status: "error", error: "Username atau password salah" });
+      return errRes(res, 401, "Username atau password salah");
     }
 
     const user = rows[0];
@@ -623,15 +693,14 @@ app.post("/kirimpesan/auth/login", async (req, res) => {
         role: user.role,
       },
     });
-  } catch (err) {
-    console.error("Error /kirimpesan/auth/login:", err);
-    return res.status(500).json({ status: "error", error: "Internal server error" });
-  }
-});
+  })
+);
 
 // ---------- ME ----------
-app.get("/kirimpesan/me", authMiddleware, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/me",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const userId = req.user.sub;
 
     const { rows } = await pgPool.query(
@@ -654,11 +723,10 @@ app.get("/kirimpesan/me", authMiddleware, async (req, res) => {
       [userId]
     );
 
-    if (!rows.length) return res.status(404).json({ status: "error", error: "User not found" });
+    if (!rows.length) return errRes(res, 404, "User not found");
 
     const me = rows[0];
-    return res.json({
-      status: "ok",
+    return ok(res, {
       me: {
         id: me.id,
         username: me.username,
@@ -671,15 +739,14 @@ app.get("/kirimpesan/me", authMiddleware, async (req, res) => {
         schoolDefaultPhoneNumberId: me.default_phone_number_id,
       },
     });
-  } catch (err) {
-    console.error("Error /kirimpesan/me:", err);
-    return res.status(500).json({ status: "error", error: "Internal server error" });
-  }
-});
+  })
+);
 
 // ---------- SENDERS ----------
-app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/senders",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
     const rows = await getWabaPhoneNumbers(ctx);
 
@@ -717,16 +784,15 @@ app.get("/kirimpesan/senders", authMiddleware, async (req, res) => {
       }
     } catch (_) {}
 
-    return res.json({ status: "ok", count: senders.length, senders });
-  } catch (err) {
-    console.error("Error /kirimpesan/senders:", err.response?.data || err.message);
-    return res.status(500).json({ status: "error", error: err.response?.data || err.message });
-  }
-});
+    return ok(res, { count: senders.length, senders });
+  })
+);
 
 // ---------- TEMPLATES ----------
-app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/templates",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
 
     let status = (req.query.status || "").toUpperCase();
@@ -748,21 +814,21 @@ app.get("/kirimpesan/templates", authMiddleware, async (req, res) => {
       components: t.components,
     }));
 
-    return res.json({ status: "ok", count: simplified.length, templates: simplified });
-  } catch (err) {
-    console.error("Error /kirimpesan/templates:", err.response?.data || err.message);
-    return res.status(500).json({ status: "error", error: err.response?.data || err.message });
-  }
-});
+    return ok(res, { count: simplified.length, templates: simplified });
+  })
+);
 
 // ---------- UPLOAD SAMPLE ----------
-app.post("/kirimpesan/templates/upload-sample", authMiddleware, upload.single("file"), async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/templates/upload-sample",
+  authMiddleware,
+  upload.single("file"),
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
 
-    if (!META_APP_ID) return res.status(500).json({ status: "error", error: "META_APP_ID belum diset" });
-    if (!ctx.wa_token) return res.status(500).json({ status: "error", error: "WA token sekolah belum diset" });
-    if (!req.file) return res.status(400).json({ status: "error", error: "file wajib diupload" });
+    if (!META_APP_ID) return errRes(res, 500, "META_APP_ID belum diset");
+    if (!ctx.wa_token) return errRes(res, 500, "WA token sekolah belum diset");
+    if (!req.file) return errRes(res, 400, "file wajib diupload");
 
     const mimeType = req.file.mimetype || "application/pdf";
     const fileName = req.file.originalname || "sample";
@@ -777,7 +843,9 @@ app.post("/kirimpesan/templates/upload-sample", authMiddleware, upload.single("f
 
     const uploadSessionId = sessResp.data?.id;
     if (!uploadSessionId) {
-      return res.status(500).json({ status: "error", error: "Gagal membuat upload session", error_raw: sessResp.data || null });
+      return errRes(res, 500, "Gagal membuat upload session", {
+        error_raw: sessResp.data || null,
+      });
     }
 
     const uploadUrl = `https://graph.facebook.com/${ctx.wa_version}/${uploadSessionId}`;
@@ -792,31 +860,26 @@ app.post("/kirimpesan/templates/upload-sample", authMiddleware, upload.single("f
 
     const handle = upResp.data?.h;
     if (!handle) {
-      return res.status(500).json({ status: "error", error: "Upload selesai tapi handle tidak ditemukan", error_raw: upResp.data || null });
+      return errRes(res, 500, "Upload selesai tapi handle tidak ditemukan", {
+        error_raw: upResp.data || null,
+      });
     }
 
-    return res.json({
-      status: "ok",
+    return ok(res, {
       handle,
       media_id: handle,
       mime_type: mimeType,
       filename: fileName,
       size: fileLength,
     });
-  } catch (err) {
-    const meta = err.response?.data;
-    console.error("Error upload-sample:", meta || err.message);
-    return res.status(err.response?.status || 500).json({
-      status: "error",
-      error_message: meta?.error?.message || err.message,
-      error_raw: meta || err.message,
-    });
-  }
-});
+  })
+);
 
 // ---------- CREATE TEMPLATE ----------
-app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/templates/create",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
 
     const {
@@ -831,7 +894,7 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
     } = req.body || {};
 
     if (!body_text || !String(body_text).trim()) {
-      return res.status(400).json({ status: "error", error: "body_text tidak boleh kosong" });
+      return errRes(res, 400, "body_text tidak boleh kosong");
     }
 
     const handleId = media_handle_id || sample_media_id;
@@ -839,10 +902,11 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
 
     if (media_sample && media_sample !== "NONE") {
       if (!handleId) {
-        return res.status(400).json({
-          status: "error",
-          error: "media_handle_id / sample_media_id wajib diisi jika media_sample bukan NONE",
-        });
+        return errRes(
+          res,
+          400,
+          "media_handle_id / sample_media_id wajib diisi jika media_sample bukan NONE"
+        );
       }
       components.push({
         type: "HEADER",
@@ -885,28 +949,17 @@ app.post("/kirimpesan/templates/create", authMiddleware, async (req, res) => {
     });
 
     return res.json({ status: "submitted", meta_response: resp.data });
-  } catch (err) {
-    const meta = err.response?.data;
-    console.error("Error /kirimpesan/templates/create:", meta || err.message);
+  })
+);
 
-    let message = err.message || "Gagal membuat template";
-    if (meta?.error?.error_user_msg) message = meta.error.error_user_msg;
-    else if (meta?.error?.message) message = meta.error.message;
-
-    return res.status(err.response?.status || 500).json({
-      status: "error",
-      error_message: message,
-      error_raw: meta || err.message,
-    });
-  }
-});
-
-// ---------- CANCEL BROADCAST (FIX: route harus DI LUAR handler /broadcast) ----------
-app.post("/kirimpesan/broadcast/:id/cancel", authMiddleware, async (req, res) => {
-  try {
+// ---------- CANCEL BROADCAST ----------
+app.post(
+  "/kirimpesan/broadcast/:id/cancel",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const schoolId = req.user.school_id;
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).json({ status: "error", error: "id wajib" });
+    if (!id) return errRes(res, 400, "id wajib");
 
     // 1) broadcast harus milik sekolah ini
     const q = await pgPool.query(
@@ -920,7 +973,7 @@ app.post("/kirimpesan/broadcast/:id/cancel", authMiddleware, async (req, res) =>
     );
 
     if (!q.rowCount) {
-      return res.status(404).json({ status: "error", error: "Broadcast tidak ditemukan" });
+      return errRes(res, 404, "Broadcast tidak ditemukan");
     }
 
     // 2) tandai recipients yang belum final jadi cancelled
@@ -933,23 +986,31 @@ app.post("/kirimpesan/broadcast/:id/cancel", authMiddleware, async (req, res) =>
       [id]
     );
 
-    return res.json({ status: "ok", broadcast_id: id, broadcast_status: "cancelled" });
-  } catch (err) {
-    console.error("Error cancel broadcast:", err);
-    return res.status(500).json({ status: "error", error: "Internal server error" });
-  }
-});
+    return ok(res, { broadcast_id: id, broadcast_status: "cancelled" });
+  })
+);
 
 // ---------- BROADCAST ----------
-app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/broadcast",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
 
-    const { template_name, rows, phone_number_id, sender_phone, followup, scheduled_at, broadcast_id } = req.body || {};
-    const DIRECT_SEND_LIMIT = parseInt(process.env.DIRECT_SEND_LIMIT || "200", 10);
+    const {
+      template_name,
+      rows,
+      phone_number_id,
+      sender_phone,
+      followup,
+      scheduled_at,
+      broadcast_id,
+    } = req.body || {};
 
-    if (!template_name) return res.status(400).json({ status: "error", error: "template_name wajib diisi" });
-    if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ status: "error", error: "rows harus array minimal 1" });
+    if (!template_name)
+      return errRes(res, 400, "template_name wajib diisi");
+    if (!Array.isArray(rows) || !rows.length)
+      return errRes(res, 400, "rows harus array minimal 1");
 
     const { paramCount, language } = await getTemplateMetadata(ctx, template_name);
 
@@ -978,7 +1039,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     if (!effectivePhoneId && sender_phone) {
       try {
         const phones = await getWabaPhoneNumbers(ctx);
-        const match = phones.find((p) => normPhone(p.display_phone_number) === normPhone(sender_phone));
+        const match = phones.find(
+          (p) => normPhone(p.display_phone_number) === normPhone(sender_phone)
+        );
         if (match) effectivePhoneId = String(match.id);
         else console.warn("sender_phone tidak ditemukan di WABA:", sender_phone);
       } catch (e) {
@@ -986,12 +1049,16 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       }
     }
 
-    if (!effectivePhoneId) effectivePhoneId = ctx.phone_number_id ? String(ctx.phone_number_id) : null;
+    if (!effectivePhoneId)
+      effectivePhoneId = ctx.phone_number_id ? String(ctx.phone_number_id) : null;
 
     // pastikan sender_phone terisi display_phone_number (biar History bener)
     let effectiveSenderPhone = sender_phone ? String(sender_phone) : null;
     if (!effectiveSenderPhone && effectivePhoneId && ctx.school_id) {
-      const display = await getDisplayPhoneByPhoneNumberId(ctx.school_id, effectivePhoneId);
+      const display = await getDisplayPhoneByPhoneNumberId(
+        ctx.school_id,
+        effectivePhoneId
+      );
       if (display) effectiveSenderPhone = display;
     }
 
@@ -1017,6 +1084,37 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
       ]
     );
 
+    // helper insert recipient queued
+    const insertRecipientQueued = async (broadcastId, phone, varsMap, mediaLink, mediaName, nextAttemptAt) => {
+      await pgPool.query(
+        `INSERT INTO broadcast_recipients (
+           id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
+           status, attempts, next_attempt_at,
+           last_error, meta_message_id,
+           sent_at, last_attempt_at, attempt_count,
+           template_ok, template_http_status, template_error,
+           queued_at, status_updated_at,
+           created_at
+         ) VALUES (
+           gen_random_uuid(), $1, $2, $3, $4, $5,
+           'queued', 0, $6,
+           NULL, NULL,
+           NULL, NULL, 0,
+           NULL, NULL, NULL,
+           NOW(), NOW(),
+           NOW()
+         )`,
+        [
+          broadcastId,
+          phone,
+          Object.keys(varsMap || {}).length ? varsMap : null,
+          mediaLink || null,
+          mediaName || null,
+          nextAttemptAt || null,
+        ]
+      );
+    };
+
     // =====================
     // MODE SCHEDULED
     // =====================
@@ -1035,32 +1133,13 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         const cn = cleanStr(row.contactname);
         if (cn) varsMap.contactname = cn;
 
-        await pgPool.query(
-          `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
-             status, attempts, next_attempt_at,
-             last_error, meta_message_id,
-             sent_at, last_attempt_at, attempt_count,
-             template_ok, template_http_status, template_error,
-             queued_at, status_updated_at,
-             created_at
-           ) VALUES (
-             gen_random_uuid(), $1, $2, $3, $4, $5,
-             'queued', 0, $6,
-             NULL, NULL,
-             NULL, NULL, 0,
-             NULL, NULL, NULL,
-             NOW(), NOW(),
-             NOW()
-           )`,
-          [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            cleanStr(row.follow_media) || null,
-            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
-            scheduledDate, // next_attempt_at = scheduled_at
-          ]
+        await insertRecipientQueued(
+          broadcastId,
+          phone,
+          varsMap,
+          cleanStr(row.follow_media),
+          cleanStr(row.follow_media_filename) || cleanStr(row.filename),
+          scheduledDate // next_attempt_at
         );
       }
 
@@ -1078,7 +1157,9 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     // =====================
     if (rows.length > DIRECT_SEND_LIMIT) {
       if (!(await isBroadcastCancelled(broadcastId))) {
-        await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [broadcastId]);
+        await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [
+          broadcastId,
+        ]);
       }
 
       for (const row of rows) {
@@ -1095,31 +1176,13 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
         const cn = cleanStr(row.contactname);
         if (cn) varsMap.contactname = cn;
 
-        await pgPool.query(
-          `INSERT INTO broadcast_recipients (
-             id, broadcast_id, phone, vars_json, follow_media, follow_media_filename,
-             status, attempts, next_attempt_at,
-             last_error, meta_message_id,
-             sent_at, last_attempt_at, attempt_count,
-             template_ok, template_http_status, template_error,
-             queued_at, status_updated_at,
-             created_at
-           ) VALUES (
-             gen_random_uuid(), $1, $2, $3, $4, $5,
-             'queued', 0, NOW(),
-             NULL, NULL,
-             NULL, NULL, 0,
-             NULL, NULL, NULL,
-             NOW(), NOW(),
-             NOW()
-           )`,
-          [
-            broadcastId,
-            phone,
-            Object.keys(varsMap).length ? varsMap : null,
-            cleanStr(row.follow_media) || null,
-            (cleanStr(row.follow_media_filename) || cleanStr(row.filename)) || null,
-          ]
+        await insertRecipientQueued(
+          broadcastId,
+          phone,
+          varsMap,
+          cleanStr(row.follow_media),
+          cleanStr(row.follow_media_filename) || cleanStr(row.filename),
+          new Date() // NOW
         );
       }
 
@@ -1241,31 +1304,42 @@ app.post("/kirimpesan/broadcast", authMiddleware, async (req, res) => {
     }
 
     const total = results.length;
-    const ok = results.filter((r) => r.ok).length;
-    const failed = total - ok;
+    const okCount = results.filter((r) => r.ok).length;
+    const failed = total - okCount;
 
     let finalStatus = "sent";
-    if (ok === 0 && failed > 0) finalStatus = "failed";
+    if (okCount === 0 && failed > 0) finalStatus = "failed";
 
     if (!(await isBroadcastCancelled(broadcastId))) {
-      await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [broadcastId, finalStatus]);
+      await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [
+        broadcastId,
+        finalStatus,
+      ]);
     }
 
-    return res.json({ status: "ok", broadcast_id: broadcastId, template_name, count: total, ok, failed, results });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast:", err);
-    return res.status(500).json({ status: "error", error: String(err) });
-  }
-});
+    return res.json({
+      status: "ok",
+      broadcast_id: broadcastId,
+      template_name,
+      count: total,
+      ok: okCount,
+      failed,
+      results,
+    });
+  })
+);
 
 // ---------- CUSTOM MESSAGE ----------
-app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/custom",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const ctx = await getCtxByUserId(req.user.sub);
     const { to, text, media, phone_number_id, broadcast_id } = req.body || {};
 
-    if (!to) return res.status(400).json({ status: "error", error: "`to` wajib diisi" });
-    if (!text && !media) return res.status(400).json({ status: "error", error: "Minimal text atau media harus diisi" });
+    if (!to) return errRes(res, 400, "`to` wajib diisi");
+    if (!text && !media)
+      return errRes(res, 400, "Minimal text atau media harus diisi");
 
     const waRes = await sendCustomMessage(ctx, { to, text, media, phone_number_id });
 
@@ -1292,12 +1366,9 @@ app.post("/kirimpesan/custom", authMiddleware, async (req, res) => {
       console.error("Gagal insert outgoing ke inbox_messages:", dbErr);
     }
 
-    return res.json({ status: "ok", to, wa_response: waRes });
-  } catch (err) {
-    console.error("Error /kirimpesan/custom:", err.response?.data || err.message);
-    return res.status(500).json({ status: "error", error: err.response?.data || err.message });
-  }
-});
+    return ok(res, { to, wa_response: waRes });
+  })
+);
 
 // =====================
 // WEBHOOK VERIFY
@@ -1317,8 +1388,9 @@ app.get("/kirimpesan/webhook", (req, res) => {
 // =====================
 // WEBHOOK INCOMING
 // =====================
-app.post("/kirimpesan/webhook", async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/webhook",
+  wrapAsync(async (req, res) => {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
@@ -1363,10 +1435,19 @@ app.post("/kirimpesan/webhook", async (req, res) => {
 
     let triggerText = "";
     if (msg.type === "text" && msg.text) triggerText = msg.text.body || "";
-    else if (msg.type === "button" && msg.button) triggerText = msg.button.text || msg.button.payload || "";
+    else if (msg.type === "button" && msg.button)
+      triggerText = msg.button.text || msg.button.payload || "";
     else if (msg.type === "interactive" && msg.interactive) {
-      if (msg.interactive.button_reply) triggerText = msg.interactive.button_reply.title || msg.interactive.button_reply.id || "";
-      else if (msg.interactive.list_reply) triggerText = msg.interactive.list_reply.title || msg.interactive.list_reply.id || "";
+      if (msg.interactive.button_reply)
+        triggerText =
+          msg.interactive.button_reply.title ||
+          msg.interactive.button_reply.id ||
+          "";
+      else if (msg.interactive.list_reply)
+        triggerText =
+          msg.interactive.list_reply.title ||
+          msg.interactive.list_reply.id ||
+          "";
     }
 
     // ambil broadcast terakhir untuk nomor ini
@@ -1414,9 +1495,10 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     const row = q.rows[0] || null;
     const broadcastId = row?.broadcast_id || null;
 
-    // simpan inbox
+    // simpan inbox (best-effort)
     try {
-      const isQuickReply = !!triggerText && (msg.type === "button" || msg.type === "interactive");
+      const isQuickReply =
+        !!triggerText && (msg.type === "button" || msg.type === "interactive");
 
       await pgPool.query(
         `INSERT INTO inbox_messages (
@@ -1454,7 +1536,9 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     // followup_config harus ada
     let followupConfig = row?.followup_config || null;
     if (typeof followupConfig === "string") {
-      try { followupConfig = JSON.parse(followupConfig); } catch {}
+      try {
+        followupConfig = JSON.parse(followupConfig);
+      } catch {}
     }
     if (!followupConfig || !followupConfig.text) return res.sendStatus(200);
 
@@ -1464,7 +1548,11 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     // media follow-up: prioritas per penerima, fallback static_media
     let media = null;
     const filenameTpl = followupConfig.static_media?.filename || null;
-    const finalFilename = buildFilenameFromTemplate(filenameTpl, varsMap, row?.follow_media_filename);
+    const finalFilename = buildFilenameFromTemplate(
+      filenameTpl,
+      varsMap,
+      row?.follow_media_filename
+    );
 
     if (row?.follow_media) {
       media = { type: "document", link: row.follow_media, filename: finalFilename };
@@ -1484,11 +1572,13 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     } catch (_) {
       followCtx = null;
     }
+
     if (!followCtx) {
       followCtx = {
         wa_token: ENV_WA_TOKEN,
         wa_version: ENV_WA_VERSION,
-        phone_number_id: phoneNumberId || row?.broadcast_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
+        phone_number_id:
+          phoneNumberId || row?.broadcast_phone_number_id || ENV_DEFAULT_PHONE_NUMBER_ID,
       };
     }
     if (!followCtx.wa_token) return res.sendStatus(200);
@@ -1533,17 +1623,16 @@ app.post("/kirimpesan/webhook", async (req, res) => {
     }
 
     return res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook ERROR:", err);
-    return res.sendStatus(500);
-  }
-});
+  })
+);
 
 // =====================
 // BROADCAST LOGS (SCOPED SCHOOL)
 // =====================
-app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/broadcast/logs",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
     const schoolId = req.user.school_id;
 
@@ -1636,21 +1725,20 @@ app.get("/kirimpesan/broadcast/logs", authMiddleware, async (req, res) => {
       };
     });
 
-    return res.json({ status: "ok", logs });
-  } catch (e) {
-    console.error("Error /kirimpesan/broadcast/logs:", e);
-    return res.status(500).json({ status: "error", message: "Gagal memuat logs" });
-  }
-});
+    return ok(res, { logs });
+  })
+);
 
 // =====================
 // BROADCAST LOG DETAIL (SCOPED SCHOOL)
 // =====================
-app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/broadcast/logs/:id",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const schoolId = req.user.school_id;
     const id = String(req.params.id || "").trim();
-    if (!id) return res.status(400).json({ status: "error", error: "id wajib" });
+    if (!id) return errRes(res, 400, "id wajib");
 
     const bcQ = await pgPool.query(
       `
@@ -1665,7 +1753,7 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
     );
 
     if (!bcQ.rows.length) {
-      return res.status(404).json({ status: "error", error: "Broadcast tidak ditemukan" });
+      return errRes(res, 404, "Broadcast tidak ditemukan");
     }
 
     const broadcast = bcQ.rows[0];
@@ -1696,24 +1784,24 @@ app.get("/kirimpesan/broadcast/logs/:id", authMiddleware, async (req, res) => {
       [id]
     );
 
-    return res.json({
-      status: "ok",
+    return ok(res, {
       log: { broadcast, recipients: recQ.rows || [], followups: folQ.rows || [] },
     });
-  } catch (e) {
-    console.error("Error /kirimpesan/broadcast/logs/:id:", e);
-    return res.status(500).json({ status: "error", error: "Gagal memuat detail broadcast" });
-  }
-});
+  })
+);
 
 // =====================
 // INBOX (SCOPED by school)
 // =====================
-app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit || "100", 10);
+app.get(
+  "/kirimpesan/inbox",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
     const schoolId = req.user.school_id;
-    const phoneNumberId = req.query.phone_number_id ? String(req.query.phone_number_id) : null;
+    const phoneNumberId = req.query.phone_number_id
+      ? String(req.query.phone_number_id)
+      : null;
 
     if (phoneNumberId) await assertPhoneNumberBelongsToSchool(phoneNumberId, schoolId);
 
@@ -1753,21 +1841,19 @@ app.get("/kirimpesan/inbox", authMiddleware, async (req, res) => {
     `;
 
     const { rows } = await pgPool.query(sql, [limit, schoolId, phoneNumberId]);
-    return res.json({ status: "ok", messages: rows });
-  } catch (err) {
-    console.error("Inbox error:", err);
-    return res.status(500).json({ status: "error", error: "Gagal memuat inbox" });
-  }
-});
+    return ok(res, { messages: rows });
+  })
+);
 
 // =====================
 // RUN SCHEDULED
 // =====================
-app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
-  const secret = req.headers["x-cron-secret"] || req.query.secret;
-  if (secret !== CRON_SECRET) return res.status(403).json({ status: "error", error: "Forbidden" });
+app.get(
+  "/kirimpesan/broadcast/run-scheduled",
+  wrapAsync(async (req, res) => {
+    const secret = req.headers["x-cron-secret"] || req.query.secret;
+    if (secret !== CRON_SECRET) return errRes(res, 403, "Forbidden");
 
-  try {
     const { rows: broadcasts } = await pgPool.query(
       `SELECT *
          FROM broadcasts
@@ -1776,7 +1862,7 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
           AND scheduled_at <= NOW()`
     );
 
-    if (!broadcasts.length) return res.json({ status: "ok", ran: [] });
+    if (!broadcasts.length) return ok(res, { ran: [] });
 
     const ran = [];
 
@@ -1842,7 +1928,13 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
         const varsMapRaw = rcp.vars_json || {};
         const varsMap =
           typeof varsMapRaw === "string"
-            ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
+            ? (() => {
+                try {
+                  return JSON.parse(varsMapRaw);
+                } catch {
+                  return {};
+                }
+              })()
             : varsMapRaw;
 
         const varsForTemplate =
@@ -1912,28 +2004,26 @@ app.get("/kirimpesan/broadcast/run-scheduled", async (req, res) => {
       }
     }
 
-    return res.json({ status: "ok", ran });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast/run-scheduled:", err);
-    return res.status(500).json({ status: "error", error: String(err) });
-  }
-});
+    return ok(res, { ran });
+  })
+);
 
 // =====================
 // RUN QUEUE (IMMEDIATE JOBS)
 // =====================
-app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
-  const secret = req.headers["x-cron-secret"] || req.query.secret;
-  if (secret !== CRON_SECRET) return res.status(403).json({ status: "error", error: "Forbidden" });
+app.get(
+  "/kirimpesan/broadcast/run-queue",
+  wrapAsync(async (req, res) => {
+    const secret = req.headers["x-cron-secret"] || req.query.secret;
+    if (secret !== CRON_SECRET) return errRes(res, 403, "Forbidden");
 
-  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
-  const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);
-  const pauseEvery = Math.min(parseInt(req.query.pause_every || "50", 10), 1000);
-  const pauseMs = Math.min(parseInt(req.query.pause_ms || "5000", 10), 60000);
-  const maxBroadcasts = Math.min(parseInt(req.query.max_broadcasts || "5", 10), 20);
-  const maxAttempts = Math.min(parseInt(req.query.max_attempts || "3", 10), 10);
+    const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+    const delay = Math.min(parseInt(req.query.delay || "400", 10), 5000);
+    const pauseEvery = Math.min(parseInt(req.query.pause_every || "50", 10), 1000);
+    const pauseMs = Math.min(parseInt(req.query.pause_ms || "5000", 10), 60000);
+    const maxBroadcasts = Math.min(parseInt(req.query.max_broadcasts || "5", 10), 20);
+    const maxAttempts = Math.min(parseInt(req.query.max_attempts || "3", 10), 10);
 
-  try {
     const { rows: broadcasts } = await pgPool.query(
       `
       SELECT *
@@ -1946,7 +2036,7 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
       [maxBroadcasts]
     );
 
-    if (!broadcasts.length) return res.json({ status: "ok", ran: [] });
+    if (!broadcasts.length) return ok(res, { ran: [] });
 
     const ran = [];
 
@@ -2024,8 +2114,12 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           const sentCount = leftQ.rows[0]?.sent_count || 0;
 
           if (leftActive === 0) {
-            const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
-            await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
+            const finalStatus =
+              sentCount > 0 ? "sent" : deadCount > 0 ? "failed" : "sent";
+            await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [
+              bc.id,
+              finalStatus,
+            ]);
           } else {
             if (!(await isBroadcastCancelled(bc.id))) {
               await pgPool.query(`UPDATE broadcasts SET status = 'queued' WHERE id = $1`, [bc.id]);
@@ -2054,7 +2148,9 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         await client.query("COMMIT");
         client.release();
       } catch (e) {
-        try { await client.query("ROLLBACK"); } catch {}
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
         client.release();
         console.error("run-queue tx error:", e);
         continue;
@@ -2073,7 +2169,13 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
         const varsMapRaw = rcp.vars_json || {};
         const varsMap =
           typeof varsMapRaw === "string"
-            ? (() => { try { return JSON.parse(varsMapRaw); } catch { return {}; } })()
+            ? (() => {
+                try {
+                  return JSON.parse(varsMapRaw);
+                } catch {
+                  return {};
+                }
+              })()
             : varsMapRaw;
 
         const varsForTemplate =
@@ -2118,11 +2220,15 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
           failCount++;
 
           const errorPayload = err.response?.data || err.message;
-          const prevAttempts = Number(rcp.attempt_count || rcp.attempts || 0);
+
+          // IMPORTANT: pakai attempts (bukan attempt_count yang udah dinaikin di tx)
+          const prevAttempts = Number(rcp.attempts || 0);
           const currentAttempts = prevAttempts + 1;
 
           const shouldDead = currentAttempts >= maxAttempts;
-          const nextAttemptAt = shouldDead ? null : new Date(Date.now() + computeBackoffMs(currentAttempts));
+          const nextAttemptAt = shouldDead
+            ? null
+            : new Date(Date.now() + computeBackoffMs(currentAttempts));
 
           await pgPool.query(
             `UPDATE broadcast_recipients
@@ -2169,7 +2275,7 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
       const sentCount = leftQ.rows[0]?.sent_count || 0;
 
       if (leftActive === 0) {
-        const finalStatus = sentCount > 0 ? "sent" : (deadCount > 0 ? "failed" : "sent");
+        const finalStatus = sentCount > 0 ? "sent" : deadCount > 0 ? "failed" : "sent";
         await pgPool.query(`UPDATE broadcasts SET status = $2 WHERE id = $1`, [bc.id, finalStatus]);
       } else {
         if (!(await isBroadcastCancelled(bc.id))) {
@@ -2190,18 +2296,16 @@ app.get("/kirimpesan/broadcast/run-queue", async (req, res) => {
       });
     }
 
-    return res.json({ status: "ok", ran });
-  } catch (err) {
-    console.error("Error /kirimpesan/broadcast/run-queue:", err);
-    return res.status(500).json({ status: "error", error: String(err) });
-  }
-});
+    return ok(res, { ran });
+  })
+);
 
 // =====================
 // PROXY MEDIA
 // =====================
-app.get("/kirimpesan/media/:id", async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/media/:id",
+  wrapAsync(async (req, res) => {
     const mediaId = req.params.id;
     if (!mediaId) return res.status(400).send("media id required");
 
@@ -2211,11 +2315,19 @@ app.get("/kirimpesan/media/:id", async (req, res) => {
     let ctx = null;
 
     if (schoolId) {
-      try { ctx = await getCtxBySchoolId(schoolId); } catch (_) { ctx = null; }
+      try {
+        ctx = await getCtxBySchoolId(schoolId);
+      } catch (_) {
+        ctx = null;
+      }
     }
 
     if (!ctx && phoneNumberIdQ) {
-      try { ctx = await getCtxByPhoneNumberId(phoneNumberIdQ); } catch (_) { ctx = null; }
+      try {
+        ctx = await getCtxByPhoneNumberId(phoneNumberIdQ);
+      } catch (_) {
+        ctx = null;
+      }
     }
 
     if (!ctx) {
@@ -2255,25 +2367,24 @@ app.get("/kirimpesan/media/:id", async (req, res) => {
 
     res.setHeader("Content-Type", mime);
     fileResp.data.pipe(res);
-  } catch (err) {
-    console.error("Error proxy media:", err.response?.data || err.message);
-    return res.status(500).send("Error fetching media");
-  }
-});
+  })
+);
 
 // =====================
 // CHANGE PASSWORD
 // =====================
-app.post("/kirimpesan/auth/change-password", authMiddleware, async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/auth/change-password",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const userId = req.user.sub;
     const { old_password, new_password } = req.body || {};
 
     if (!old_password || !new_password) {
-      return res.status(400).json({ status: "error", error: "old_password & new_password wajib" });
+      return errRes(res, 400, "old_password & new_password wajib");
     }
     if (String(new_password).length < 8) {
-      return res.status(400).json({ status: "error", error: "new_password minimal 8 karakter" });
+      return errRes(res, 400, "new_password minimal 8 karakter");
     }
 
     const chk = await pgPool.query(
@@ -2285,7 +2396,7 @@ app.post("/kirimpesan/auth/change-password", authMiddleware, async (req, res) =>
       [userId, String(old_password)]
     );
 
-    if (!chk.rows.length) return res.status(401).json({ status: "error", error: "old_password salah" });
+    if (!chk.rows.length) return errRes(res, 401, "old_password salah");
 
     await pgPool.query(
       `UPDATE users
@@ -2294,18 +2405,17 @@ app.post("/kirimpesan/auth/change-password", authMiddleware, async (req, res) =>
       [userId, String(new_password)]
     );
 
-    return res.json({ status: "ok" });
-  } catch (err) {
-    console.error("Error change-password:", err);
-    return res.status(500).json({ status: "error", error: "Internal server error" });
-  }
-});
+    return ok(res, {});
+  })
+);
 
 // =====================
 // SET DEFAULT SENDER PER USER
 // =====================
-app.patch("/kirimpesan/users/me/sender", authMiddleware, async (req, res) => {
-  try {
+app.patch(
+  "/kirimpesan/users/me/sender",
+  authMiddleware,
+  wrapAsync(async (req, res) => {
     const userId = req.user.sub;
     const schoolId = req.user.school_id;
     const { phone_number_id } = req.body || {};
@@ -2318,18 +2428,18 @@ app.patch("/kirimpesan/users/me/sender", authMiddleware, async (req, res) => {
     await assertPhoneNumberBelongsToSchool(pnid, schoolId);
 
     await pgPool.query(`UPDATE users SET phone_number_id = $2 WHERE id = $1`, [userId, pnid]);
-    return res.json({ status: "ok", phone_number_id: pnid });
-  } catch (err) {
-    console.error("Error set sender:", err);
-    return res.status(400).json({ status: "error", error: err.message || "Bad request" });
-  }
-});
+    return ok(res, { phone_number_id: pnid });
+  })
+);
 
 // =====================
 // USERS LIST + CREATE
 // =====================
-app.get("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => {
-  try {
+app.get(
+  "/kirimpesan/users",
+  authMiddleware,
+  requireAdmin,
+  wrapAsync(async (req, res) => {
     const schoolId = req.user.school_id;
 
     const { rows } = await pgPool.query(
@@ -2346,20 +2456,20 @@ app.get("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => {
       [schoolId]
     );
 
-    return res.json({ status: "ok", count: rows.length, users: rows });
-  } catch (err) {
-    console.error("Error list users:", err);
-    return res.status(500).json({ status: "error", error: "Internal server error" });
-  }
-});
+    return ok(res, { count: rows.length, users: rows });
+  })
+);
 
-app.post("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => {
-  try {
+app.post(
+  "/kirimpesan/users",
+  authMiddleware,
+  requireAdmin,
+  wrapAsync(async (req, res) => {
     const schoolId = req.user.school_id;
     const { username, password, display_name_user, role, phone_number_id } = req.body || {};
 
-    if (!username || !password) return res.status(400).json({ status: "error", error: "username & password wajib" });
-    if (String(password).length < 8) return res.status(400).json({ status: "error", error: "password minimal 8 karakter" });
+    if (!username || !password) return errRes(res, 400, "username & password wajib");
+    if (String(password).length < 8) return errRes(res, 400, "password minimal 8 karakter");
 
     const uname = String(username).trim().toLowerCase();
     const r = role ? String(role).trim().toLowerCase() : "operator";
@@ -2380,12 +2490,31 @@ app.post("/kirimpesan/users", authMiddleware, requireAdmin, async (req, res) => 
       [uname, String(password), display_name_user || null, r, schoolId, pnid]
     );
 
-    return res.json({ status: "ok", user: rows[0] });
-  } catch (err) {
-    const msg = err?.code === "23505" ? "username sudah dipakai" : (err.message || "Internal error");
-    console.error("Error create user:", err);
-    return res.status(400).json({ status: "error", error: msg });
+    return ok(res, { user: rows[0] });
+  })
+);
+
+// =====================
+// GLOBAL ERROR HANDLER
+// =====================
+app.use((err, req, res, _next) => {
+  const rid = req?._rid || "-";
+  console.error(`🔥 ERROR rid=${rid}`, err?.response?.data || err);
+
+  // axios meta error
+  if (err?.response?.status) {
+    return res.status(500).json({
+      status: "error",
+      error: err.response.data || err.message || "Upstream error",
+      rid,
+    });
   }
+
+  return res.status(500).json({
+    status: "error",
+    error: err.message || "Internal server error",
+    rid,
+  });
 });
 
 // =====================
